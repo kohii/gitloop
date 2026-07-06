@@ -1,10 +1,11 @@
-// Command gitloop is a daemon that watches a git repository's working tree
-// and keeps it synced with its remote (auto commit / push / rebase).
+// Command gitloop is a daemon that watches one or more git repositories'
+// working trees and keeps them synced with their remotes (auto commit /
+// push / rebase).
 package main
 
 import (
-	"flag"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -12,14 +13,17 @@ import (
 // can override it with -ldflags "-X main.version=...".
 var version = "dev"
 
-const usage = `gitloop watches a git repository and keeps it synced with its remote.
+const usage = `gitloop watches one or more git repositories and keeps them synced with their remotes.
 
 Usage:
   gitloop <command> [flags]
 
 Commands:
-  run       Start the sync daemon
-  version   Print the version and exit
+  run         Start the sync daemon in the foreground
+  install     Install and start the launchd agent
+  uninstall   Stop and remove the launchd agent
+  status      Show each configured repository's last known sync state
+  version     Print the version and exit
 
 Use "gitloop <command> -h" for details on a command.
 `
@@ -28,13 +32,14 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdout, stderr *os.File) int {
+func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprint(stdout, usage)
 		return 0
 	}
 
-	switch cmd, rest := args[0], args[1:]; cmd {
+	cmd, rest := args[0], args[1:]
+	switch cmd {
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -43,26 +48,14 @@ func run(args []string, stdout, stderr *os.File) int {
 		return 0
 	case "run":
 		return runCmd(rest, stdout, stderr)
+	case "install":
+		return installCmd(rest, stdout, stderr)
+	case "uninstall":
+		return uninstallCmd(rest, stdout, stderr)
+	case "status":
+		return statusCmd(rest, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "gitloop: unknown command %q\n\n%s", cmd, usage)
 		return 1
 	}
-}
-
-func runCmd(args []string, stdout, stderr *os.File) int {
-	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	configPath := fs.String("config", "", "path to the gitloop config file (required)")
-	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-
-	if *configPath == "" {
-		fmt.Fprintln(stderr, "gitloop run: -config is required")
-		return 2
-	}
-
-	// TODO: load config, start the daemon's watch/debounce/sync loop.
-	fmt.Fprintf(stdout, "gitloop run: not implemented yet (config: %s)\n", *configPath)
-	return 0
 }
