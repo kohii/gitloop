@@ -2,7 +2,7 @@
 
 gitloop is a daemon that watches one or more git repositories' working trees
 and keeps them synced with their remotes by automatically committing,
-pushing, and rebasing. It works with any git repository — as the sync
+pushing, and merging. It works with any git repository — as the sync
 backend for a note-taking app, or standalone for unrelated use cases such as
 syncing an Obsidian vault to GitHub.
 
@@ -94,14 +94,19 @@ runs one cycle per repository:
    | 0     | 0      | nothing to do       |
    | >0    | 0      | push                |
    | 0     | >0     | fast-forward merge  |
-   | >0    | >0     | rebase, then push   |
+   | >0    | >0     | merge, then push    |
 
 See `docs/design.md` for the full state table and the conflict-resolution
 flow diagram.
 
+gitloop never runs `git reset --hard` or `git push --force`: every history
+change it makes is an ordinary commit (an auto-commit, a merge commit, or a
+merge commit carrying conflict backups), so nothing is ever discarded except
+into `git reflog`'s normal safety net.
+
 ## Conflict resolution
 
-If a rebase stops on a real conflict, `on_conflict` decides what happens:
+If a merge stops on a real conflict, `on_conflict` decides what happens:
 
 - **`claude`** (default): runs `claude -p` on each conflicted file to
   resolve the markers, then checks the file for leftover `<<<<<<<` /
@@ -111,10 +116,11 @@ If a rebase stops on a real conflict, `on_conflict` decides what happens:
   `backup` automatically.
 - **`backup`**: saves both sides of each conflicted file next to the
   original, e.g. `notes/todo.conflict.macbook-air.20260707153000.ours.md`
-  and `...theirs.md`, aborts the rebase, resets the branch to upstream, and
-  commits the backup files. Nothing is lost — the discarded local commit's
-  content lives on in the `.theirs.` file (and in `git reflog`) — but
-  reconciling it back into the real file is left to you.
+  and `...theirs.md`, then accepts the upstream (`theirs`) version of each
+  conflicted file and completes the merge commit. Nothing is lost — the
+  discarded local content lives on in the `.ours.` file (and the commit
+  that introduced it stays in `git log`/`git reflog`) — but reconciling it
+  back into the real file is left to you.
 
 Either way, a conflict is logged at `warn`/`error` level; gitloop does not
 retry the same conflict indefinitely.

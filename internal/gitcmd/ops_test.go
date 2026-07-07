@@ -111,7 +111,7 @@ func TestFetchAndRevListLeftRightCount(t *testing.T) {
 	}
 }
 
-func TestRebaseReportsConflict(t *testing.T) {
+func TestMergeReportsConflict(t *testing.T) {
 	requireGit(t)
 
 	dir := t.TempDir()
@@ -141,12 +141,12 @@ func TestRebaseReportsConflict(t *testing.T) {
 	runIn(t, dir, "commit", "-q", "-m", "upstream change")
 	runIn(t, dir, "checkout", "-q", "main")
 
-	conflict, err := r.Rebase("upstream")
+	conflict, err := r.Merge("upstream")
 	if err != nil {
-		t.Fatalf("Rebase: %v", err)
+		t.Fatalf("Merge: %v", err)
 	}
 	if !conflict {
-		t.Fatalf("Rebase() conflict = false, want true")
+		t.Fatalf("Merge() conflict = false, want true")
 	}
 
 	files, err := r.ConflictedFiles()
@@ -157,22 +157,31 @@ func TestRebaseReportsConflict(t *testing.T) {
 		t.Fatalf("ConflictedFiles = %v, want [a.md]", files)
 	}
 
-	if _, ok, err := r.ShowStage(2, "a.md"); err != nil || !ok {
-		t.Errorf("ShowStage(2, a.md) ok=%v err=%v, want ok", ok, err)
+	// During a merge (unlike a rebase) "ours" (stage 2) is the local branch
+	// and "theirs" (stage 3) is the branch being merged in.
+	if content, ok, err := r.ShowStage(2, "a.md"); err != nil || !ok || content != "local change\n" {
+		t.Errorf("ShowStage(2, a.md) = %q, ok=%v err=%v, want \"local change\\n\", ok", content, ok, err)
 	}
-	if _, ok, err := r.ShowStage(3, "a.md"); err != nil || !ok {
-		t.Errorf("ShowStage(3, a.md) ok=%v err=%v, want ok", ok, err)
+	if content, ok, err := r.ShowStage(3, "a.md"); err != nil || !ok || content != "upstream change\n" {
+		t.Errorf("ShowStage(3, a.md) = %q, ok=%v err=%v, want \"upstream change\\n\", ok", content, ok, err)
 	}
 
-	if err := r.RebaseAbort(); err != nil {
-		t.Fatalf("RebaseAbort: %v", err)
+	if err := r.CheckoutTheirs("a.md"); err != nil {
+		t.Fatalf("CheckoutTheirs: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "a.md")); err != nil || string(got) != "upstream change\n" {
+		t.Errorf("a.md after CheckoutTheirs = %q, err=%v, want \"upstream change\\n\"", got, err)
+	}
+
+	if err := r.MergeAbort(); err != nil {
+		t.Fatalf("MergeAbort: %v", err)
 	}
 	entries, err := r.StatusPorcelain()
 	if err != nil {
 		t.Fatalf("StatusPorcelain: %v", err)
 	}
 	if len(entries) != 0 {
-		t.Errorf("StatusPorcelain after RebaseAbort = %#v, want clean", entries)
+		t.Errorf("StatusPorcelain after MergeAbort = %#v, want clean", entries)
 	}
 }
 

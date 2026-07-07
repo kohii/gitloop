@@ -78,49 +78,39 @@ func (r *Runner) MergeFF(upstream string) error {
 	return err
 }
 
-// Rebase replays the current branch's commits onto upstream
-// (`git rebase <upstream>`). If the rebase stops on a conflict, Rebase
-// returns (true, nil) rather than an error: a paused rebase is an expected
-// outcome the caller must handle, not a failure of the git invocation.
-func (r *Runner) Rebase(upstream string) (conflict bool, err error) {
-	_, runErr := r.run("rebase", upstream)
+// Merge merges upstream into the current branch
+// (`git merge --no-ff --no-edit <upstream>`), creating a merge commit with
+// git's default message. Callers only use Merge once local and upstream
+// have diverged, where a fast-forward is never possible anyway; --no-ff
+// makes that explicit so git doesn't refuse the merge asking which mode was
+// intended. --no-edit avoids spawning an editor for the default message,
+// which would otherwise hang a non-interactive daemon. If the merge stops
+// on a conflict, Merge returns (true, nil) rather than an error: a paused
+// merge is an expected outcome the caller must handle, not a failure of the
+// git invocation.
+func (r *Runner) Merge(upstream string) (conflict bool, err error) {
+	_, runErr := r.run("merge", "--no-ff", "--no-edit", upstream)
 	if runErr == nil {
 		return false, nil
 	}
-	if r.hasRebaseInProgress() {
+	if r.hasMergeInProgress() {
 		return true, nil
 	}
 	return false, runErr
 }
 
-// RebaseContinue resumes a paused rebase after conflicts have been resolved
-// and staged (`git rebase --continue`). Like Rebase, it returns
-// (true, nil) if the rebase stops again on a later conflicting commit.
-func (r *Runner) RebaseContinue() (conflict bool, err error) {
-	_, runErr := r.run("rebase", "--continue")
-	if runErr == nil {
-		return false, nil
-	}
-	if r.hasRebaseInProgress() {
-		return true, nil
-	}
-	return false, runErr
-}
-
-// RebaseAbort cancels an in-progress rebase and restores the branch to its
-// pre-rebase state (`git rebase --abort`).
-func (r *Runner) RebaseAbort() error {
-	_, err := r.run("rebase", "--abort")
+// MergeAbort cancels an in-progress merge and restores the working tree to
+// its pre-merge state (`git merge --abort`).
+func (r *Runner) MergeAbort() error {
+	_, err := r.run("merge", "--abort")
 	return err
 }
 
-// ResetHard resets the current branch to rev, discarding local commits and
-// working-tree changes (`git reset --hard <rev>`). It is used to recover
-// from an unresolvable conflict: once both sides of the conflict are backed
-// up as plain files, the local branch is reset to upstream so the
-// repository stops re-diverging (and re-conflicting) on every cycle.
-func (r *Runner) ResetHard(rev string) error {
-	_, err := r.run("reset", "--hard", rev)
+// CheckoutTheirs replaces path's working-tree and index content with the
+// incoming side of an in-progress merge conflict
+// (`git checkout --theirs -- <path>`).
+func (r *Runner) CheckoutTheirs(path string) error {
+	_, err := r.run("checkout", "--theirs", "--", path)
 	return err
 }
 
@@ -157,13 +147,9 @@ func (r *Runner) ShowStage(stage int, path string) (content string, ok bool, err
 	return res.Stdout, true, nil
 }
 
-// hasRebaseInProgress reports whether .git/rebase-merge or .git/rebase-apply
-// exists, i.e. a rebase is currently paused (on a conflict or otherwise).
-func (r *Runner) hasRebaseInProgress() bool {
-	for _, name := range []string{"rebase-merge", "rebase-apply"} {
-		if _, err := os.Stat(filepath.Join(r.Dir, ".git", name)); err == nil {
-			return true
-		}
-	}
-	return false
+// hasMergeInProgress reports whether .git/MERGE_HEAD exists, i.e. a merge is
+// currently paused on a conflict.
+func (r *Runner) hasMergeInProgress() bool {
+	_, err := os.Stat(filepath.Join(r.Dir, ".git", "MERGE_HEAD"))
+	return err == nil
 }

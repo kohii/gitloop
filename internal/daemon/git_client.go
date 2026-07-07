@@ -14,10 +14,9 @@ type GitClient interface {
 	CurrentBranch() (string, error)
 	RevListLeftRightCount(local, upstream string) (ahead, behind int, err error)
 	MergeFF(upstream string) error
-	Rebase(upstream string) (conflict bool, err error)
-	RebaseContinue() (conflict bool, err error)
-	RebaseAbort() error
-	ResetHard(rev string) error
+	Merge(upstream string) (conflict bool, err error)
+	MergeAbort() error
+	CheckoutTheirs(path string) error
 	Push(remote, branch string) error
 	ConflictedFiles() ([]string, error)
 	ShowStage(stage int, path string) (content string, ok bool, err error)

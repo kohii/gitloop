@@ -11,9 +11,10 @@ const (
 	// FastForwardMerge means the remote has commits the local branch lacks
 	// and no local commits are ahead; fast-forward the local branch.
 	FastForwardMerge
-	// RebaseThenPush means both sides have diverged; rebase local commits
-	// onto upstream, then push.
-	RebaseThenPush
+	// MergeThenPush means both sides have diverged; merge upstream into the
+	// local branch (fast-forwarding if possible, otherwise a merge commit),
+	// then push.
+	MergeThenPush
 )
 
 // String returns the lower-case name of the action, e.g. "push".
@@ -25,8 +26,8 @@ func (a Action) String() string {
 		return "push"
 	case FastForwardMerge:
 		return "fast-forward-merge"
-	case RebaseThenPush:
-		return "rebase-then-push"
+	case MergeThenPush:
+		return "merge-then-push"
 	default:
 		return "unknown"
 	}
@@ -40,7 +41,7 @@ func ActionFor(s RelativeState) Action {
 	case Behind:
 		return FastForwardMerge
 	case Diverged:
-		return RebaseThenPush
+		return MergeThenPush
 	default: // Equal, or an unrecognized state
 		return NoOp
 	}

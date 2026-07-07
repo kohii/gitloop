@@ -12,18 +12,16 @@ import (
 )
 
 // fakeConflictGit is a GitClient double focused on the conflict-resolution
-// path: it starts "mid-rebase" with pre-seeded conflict content and records
+// path: it starts "mid-merge" with pre-seeded conflict content and records
 // which recovery operations get called.
 type fakeConflictGit struct {
-	conflictedFiles        []string
-	contents               map[string]map[int]string // path -> stage -> content
-	resetHardCalled        bool
-	resetHardRev           string
-	rebaseAbortCalled      bool
-	addAllCalled           bool
-	addedPaths             []string
-	committed              []string
-	rebaseContinueConflict bool
+	conflictedFiles  []string
+	contents         map[string]map[int]string // path -> stage -> content
+	mergeAbortCalled bool
+	checkedOutTheirs []string
+	addAllCalled     bool
+	addedPaths       []string
+	committed        []string
 }
 
 func (f *fakeConflictGit) StatusPorcelain() ([]gitcmd.StatusEntry, error) { return nil, nil }
@@ -38,15 +36,11 @@ func (f *fakeConflictGit) CurrentBranch() (string, error) { return "main", nil }
 func (f *fakeConflictGit) RevListLeftRightCount(string, string) (int, int, error) {
 	return 0, 0, nil
 }
-func (f *fakeConflictGit) MergeFF(string) error        { return nil }
-func (f *fakeConflictGit) Rebase(string) (bool, error) { return true, nil }
-func (f *fakeConflictGit) RebaseContinue() (bool, error) {
-	return f.rebaseContinueConflict, nil
-}
-func (f *fakeConflictGit) RebaseAbort() error { f.rebaseAbortCalled = true; return nil }
-func (f *fakeConflictGit) ResetHard(rev string) error {
-	f.resetHardCalled = true
-	f.resetHardRev = rev
+func (f *fakeConflictGit) MergeFF(string) error       { return nil }
+func (f *fakeConflictGit) Merge(string) (bool, error) { return true, nil }
+func (f *fakeConflictGit) MergeAbort() error          { f.mergeAbortCalled = true; return nil }
+func (f *fakeConflictGit) CheckoutTheirs(p string) error {
+	f.checkedOutTheirs = append(f.checkedOutTheirs, p)
 	return nil
 }
 func (f *fakeConflictGit) Push(string, string) error          { return nil }
@@ -62,13 +56,12 @@ func (f *fakeConflictGit) ShowStage(stage int, path string) (string, bool, error
 
 var _ GitClient = (*fakeConflictGit)(nil)
 
-// TestResolveConflictsBackupPolicyResetsToUpstream locks in a bug found
-// during manual end-to-end testing: aborting the rebase alone leaves the
-// branch exactly as diverged as before, so the very next cycle hits the
-// identical conflict and backs it up again, forever. resolveConflicts must
-// also reset the branch to upstream so the repository reaches a stable
-// (non-conflicting) state after one backup.
-func TestResolveConflictsBackupPolicyResetsToUpstream(t *testing.T) {
+// TestResolveConflictsBackupPolicyAcceptsTheirs verifies the backup policy's
+// end state: it must not leave the repository re-diverged (which would hit
+// the identical conflict again on the very next cycle), so it accepts the
+// incoming (upstream) side for each conflicted file — after backing up both
+// sides — and completes the merge with a commit.
+func TestResolveConflictsBackupPolicyAcceptsTheirs(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -79,21 +72,24 @@ func TestResolveConflictsBackupPolicyResetsToUpstream(t *testing.T) {
 		},
 	}
 
-	completed := resolveConflicts(git, dir, "origin/main", config.OnConflictBackup, "test-host", logger)
-	if completed {
-		t.Fatal("resolveConflicts() = true, want false for the backup policy")
+	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictBackup, "test-host", logger)
+	if !completed {
+		t.Fatal("resolveConflicts() completed = false, want true for the backup policy")
 	}
-	if !git.rebaseAbortCalled {
-		t.Error("expected RebaseAbort to be called")
+	if !backup {
+		t.Error("resolveConflicts() backup = false, want true for the backup policy")
 	}
-	if !git.resetHardCalled || git.resetHardRev != "origin/main" {
-		t.Errorf("expected ResetHard(\"origin/main\"), got called=%v rev=%q", git.resetHardCalled, git.resetHardRev)
+	if git.mergeAbortCalled {
+		t.Error("did not expect MergeAbort to be called on a successful backup resolution")
+	}
+	if len(git.checkedOutTheirs) != 1 || git.checkedOutTheirs[0] != "a.md" {
+		t.Errorf("checkedOutTheirs = %v, want [a.md]", git.checkedOutTheirs)
 	}
 	if !git.addAllCalled {
 		t.Error("expected AddAll to stage the backup files")
 	}
-	if len(git.committed) != 1 || !strings.Contains(git.committed[0], "conflict backup") {
-		t.Errorf("committed messages = %v, want exactly one mentioning \"conflict backup\"", git.committed)
+	if len(git.committed) != 1 || !strings.Contains(git.committed[0], "merged upstream with backups") {
+		t.Errorf("committed messages = %v, want exactly one mentioning \"merged upstream with backups\"", git.committed)
 	}
 
 	entries, err := os.ReadDir(dir)
@@ -129,12 +125,12 @@ func TestResolveConflictsFallsBackToBackupWhenClaudeUnavailable(t *testing.T) {
 		},
 	}
 
-	completed := resolveConflicts(git, dir, "origin/main", config.OnConflictClaude, "test-host", logger)
-	if completed {
-		t.Fatal("resolveConflicts() = true, want false (claude unavailable should fall back to backup)")
+	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictClaude, "test-host", logger)
+	if !completed {
+		t.Fatal("resolveConflicts() completed = false, want true (claude unavailable should fall back to backup)")
 	}
-	if !git.resetHardCalled {
-		t.Error("expected the backup fallback to reset to upstream")
+	if !backup {
+		t.Error("expected the claude-unavailable fallback to go through the backup policy")
 	}
 }
 
@@ -157,14 +153,20 @@ func TestResolveConflictsWithClaudeSucceeds(t *testing.T) {
 	}
 
 	git := &fakeConflictGit{conflictedFiles: []string{"a.md"}}
-	completed := resolveConflicts(git, dir, "origin/main", config.OnConflictClaude, "test-host", logger)
+	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictClaude, "test-host", logger)
 	if !completed {
-		t.Fatal("resolveConflicts() = false, want true when claude resolves the conflict cleanly")
+		t.Fatal("resolveConflicts() completed = false, want true when claude resolves the conflict cleanly")
 	}
-	if git.resetHardCalled {
-		t.Error("did not expect ResetHard when claude resolution succeeds")
+	if backup {
+		t.Error("did not expect the backup policy to run when claude resolution succeeds")
+	}
+	if git.mergeAbortCalled {
+		t.Error("did not expect MergeAbort when claude resolution succeeds")
 	}
 	if len(git.addedPaths) != 1 || git.addedPaths[0] != "a.md" {
 		t.Errorf("addedPaths = %v, want [a.md]", git.addedPaths)
+	}
+	if len(git.committed) != 1 || !strings.Contains(git.committed[0], "claude-resolved") {
+		t.Errorf("committed messages = %v, want exactly one mentioning \"claude-resolved\"", git.committed)
 	}
 }

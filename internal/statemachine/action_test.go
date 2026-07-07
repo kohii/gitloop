@@ -10,7 +10,7 @@ func TestActionFor(t *testing.T) {
 		{Equal, NoOp},
 		{Ahead, Push},
 		{Behind, FastForwardMerge},
-		{Diverged, RebaseThenPush},
+		{Diverged, MergeThenPush},
 	}
 
 	for _, c := range cases {
@@ -30,7 +30,7 @@ func TestActionString(t *testing.T) {
 		{NoOp, "noop"},
 		{Push, "push"},
 		{FastForwardMerge, "fast-forward-merge"},
-		{RebaseThenPush, "rebase-then-push"},
+		{MergeThenPush, "merge-then-push"},
 		{Action(99), "unknown"},
 	}
 

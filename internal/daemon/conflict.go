@@ -12,66 +12,57 @@ import (
 	"github.com/kohii/gitloop/internal/config"
 )
 
-// maxConflictStops bounds how many times resolveConflicts will drive
-// `git rebase --continue` into a fresh conflict before giving up. This
-// covers a multi-commit rebase where more than one commit conflicts; it is
-// not expected to be hit in practice.
-const maxConflictStops = 50
-
-// resolveConflicts is called after git.Rebase (or RebaseContinue) reports a
-// conflict. It applies the configured policy and, on success, drives the
-// rebase to completion. It returns true only if the rebase fully completed
-// (with all conflicts resolved via git add + rebase --continue).
+// resolveConflicts is called after git.Merge reports a conflict. A merge
+// exposes every conflicting file in a single stop (unlike a rebase, which
+// can pause repeatedly as it replays commits one by one), so this applies
+// the configured policy once per cycle and then creates the merge commit
+// itself — it never calls back into git for a second round.
 //
-// On failure it always leaves the repository in a clean, non-rebasing
-// state: either the backup policy already ran (which aborts the rebase and
-// resets to upstream), or resolveConflicts aborts it directly.
-func resolveConflicts(git GitClient, repoPath, upstream string, policy config.OnConflict, hostname string, logger *slog.Logger) bool {
-	for i := 0; i < maxConflictStops; i++ {
-		files, err := git.ConflictedFiles()
-		if err != nil {
-			logger.Error("listing conflicted files failed", "error", err)
-			abortRebase(git, logger)
-			return false
-		}
-
-		if len(files) > 0 {
-			resolved := false
-			if policy == config.OnConflictClaude && isClaudeAvailable() {
-				resolved = tryResolveWithClaude(git, repoPath, files, logger)
-				if !resolved {
-					logger.Warn("claude conflict resolution failed, falling back to backup policy", "files", files)
-				}
-			} else if policy == config.OnConflictClaude {
-				logger.Warn("on_conflict is \"claude\" but the claude CLI or ANTHROPIC_API_KEY is unavailable, falling back to backup policy")
-			}
-
-			if !resolved {
-				backupAndAbort(git, repoPath, upstream, files, hostname, logger)
-				return false
-			}
-		}
-
-		conflict, err := git.RebaseContinue()
-		if err != nil {
-			logger.Error("rebase --continue failed", "error", err)
-			abortRebase(git, logger)
-			return false
-		}
-		if !conflict {
-			return true
-		}
-		// Another commit in the same rebase conflicted; loop and resolve it.
+// It returns completed=true only if the merge commit was created. backup
+// reports whether the backup policy (rather than a clean claude resolution)
+// is what got it there: the caller uses this to tell "merged, and unresolved
+// conflict backups now need human attention" apart from "merged cleanly".
+//
+// On failure it always leaves the repository in a clean, non-merging state
+// by aborting the merge.
+func resolveConflicts(git GitClient, repoPath, upstream string, policy config.OnConflict, hostname string, logger *slog.Logger) (completed, backup bool) {
+	files, err := git.ConflictedFiles()
+	if err != nil {
+		logger.Error("listing conflicted files failed", "error", err)
+		abortMerge(git, logger)
+		return false, false
+	}
+	if len(files) == 0 {
+		logger.Warn("merge reported a conflict but no conflicted files were found; aborting defensively")
+		abortMerge(git, logger)
+		return false, false
 	}
 
-	logger.Error("rebase kept conflicting past the retry limit, aborting", "limit", maxConflictStops)
-	abortRebase(git, logger)
-	return false
+	if policy == config.OnConflictClaude && isClaudeAvailable() {
+		if tryResolveWithClaude(git, repoPath, files, logger) {
+			msg := fmt.Sprintf("[%s] %s — merged upstream (claude-resolved): %s",
+				hostname, time.Now().Format("2006-01-02 15:04"), strings.Join(files, ", "))
+			if err := git.Commit(msg); err != nil {
+				logger.Error("committing claude-resolved merge failed", "error", err)
+				abortMerge(git, logger)
+				return false, false
+			}
+			return true, false
+		}
+		logger.Warn("claude conflict resolution failed, falling back to backup policy", "files", files)
+	} else if policy == config.OnConflictClaude {
+		logger.Warn("on_conflict is \"claude\" but the claude CLI or ANTHROPIC_API_KEY is unavailable, falling back to backup policy")
+	}
+
+	if !backupAndAcceptTheirs(git, repoPath, upstream, files, hostname, logger) {
+		return false, false
+	}
+	return true, true
 }
 
-func abortRebase(git GitClient, logger *slog.Logger) {
-	if err := git.RebaseAbort(); err != nil {
-		logger.Error("rebase --abort failed", "error", err)
+func abortMerge(git GitClient, logger *slog.Logger) {
+	if err := git.MergeAbort(); err != nil {
+		logger.Error("merge --abort failed", "error", err)
 	}
 }
 
@@ -133,45 +124,54 @@ func hasConflictMarkers(path string) bool {
 	return strings.Contains(s, "<<<<<<<") || strings.Contains(s, "=======") || strings.Contains(s, ">>>>>>>")
 }
 
-// backupAndAbort preserves both sides of each conflicted file next to the
-// original (see writeBackupFile for the naming scheme), aborts the rebase,
-// and then resets the branch to upstream and commits the backup files on
-// top of it.
+// backupAndAcceptTheirs preserves both sides of each conflicted file next to
+// the original (see writeBackupFile for the naming scheme), then resolves
+// the conflict by accepting the incoming (upstream) side and committing the
+// merge.
 //
-// Resetting to upstream (rather than leaving the pre-rebase, still-diverged
-// branch in place) is what makes this a terminal outcome instead of a
-// retry loop: the local commits that caused the conflict are discarded from
-// the branch, so the next cycle sees Equal/Ahead instead of hitting the
-// exact same conflict again. Nothing is lost — both sides' content is
-// preserved in the backup files (and the discarded commits remain reachable
-// from the reflog) for the user to reconcile by hand.
-func backupAndAbort(git GitClient, repoPath, upstream string, files []string, hostname string, logger *slog.Logger) {
+// Upstream is treated as the side of record because it has already been
+// pushed and may be visible to other devices; the local ("ours") side is
+// still-unshared and would otherwise be silently discarded, so it's rescued
+// into a backup file for the user to reconcile by hand instead. Nothing is
+// lost: both sides' content is preserved in the backup files, and the
+// commit that created the local side remains reachable from git history.
+func backupAndAcceptTheirs(git GitClient, repoPath, upstream string, files []string, hostname string, logger *slog.Logger) bool {
 	ts := time.Now().Format("20060102150405")
 
 	for _, f := range files {
 		oursSaved := backupStage(git, repoPath, f, 2, "ours", hostname, ts, logger)
 		theirsSaved := backupStage(git, repoPath, f, 3, "theirs", hostname, ts, logger)
-		logger.Warn("backed up conflicting file instead of auto-resolving",
+		logger.Warn("backed up conflicting file and accepted the upstream version",
 			"file", f, "ours_saved", oursSaved, "theirs_saved", theirsSaved)
+
+		if err := git.CheckoutTheirs(f); err != nil {
+			logger.Error("checkout --theirs failed", "file", f, "error", err)
+			abortMerge(git, logger)
+			return false
+		}
+		if err := git.AddPath(f); err != nil {
+			logger.Error("git add for conflicting file failed", "file", f, "error", err)
+			abortMerge(git, logger)
+			return false
+		}
 	}
 
-	if err := git.RebaseAbort(); err != nil {
-		logger.Error("rebase --abort failed", "error", err)
-		return
-	}
-	if err := git.ResetHard(upstream); err != nil {
-		logger.Error("resetting to upstream after conflict backup failed", "error", err)
-		return
-	}
 	if err := git.AddAll(); err != nil {
 		logger.Error("staging conflict backup files failed", "error", err)
-		return
+		abortMerge(git, logger)
+		return false
 	}
-	msg := fmt.Sprintf("[%s] %s — conflict backup: %s", hostname, time.Now().Format("2006-01-02 15:04"), strings.Join(files, ", "))
+
+	msg := fmt.Sprintf("[%s] %s — merged upstream with backups: %s",
+		hostname, time.Now().Format("2006-01-02 15:04"), strings.Join(files, ", "))
 	if err := git.Commit(msg); err != nil {
-		logger.Warn("committing conflict backup files failed (there may be nothing to commit)", "error", err)
+		logger.Error("committing merge with conflict backups failed", "error", err)
+		abortMerge(git, logger)
+		return false
 	}
-	logger.Warn("reset to upstream after conflict; local changes to the conflicted files were discarded from history but preserved in backup files", "upstream", upstream, "files", files)
+	logger.Warn("merged upstream, accepting the incoming version of conflicting files; local changes to those files were preserved in backup files",
+		"upstream", upstream, "files", files)
+	return true
 }
 
 func backupStage(git GitClient, repoPath, file string, stage int, side, hostname, ts string, logger *slog.Logger) bool {

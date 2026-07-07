@@ -8,10 +8,10 @@ generated launchd agent looks like.
 ## Dependencies
 
 - **System `git` CLI via `os/exec`**, not `go-git` or `libgit2`. gitloop
-  needs `rebase`, `rebase --continue`/`--abort`, and index stages during a
-  conflict (`git show :2:<path>` / `:3:<path>`) — all exactly as the
-  system git implements them. A Go git library would mean re-implementing
-  or approximating that behavior; shelling out gets it for free and stays
+  needs `merge`, `merge --abort`, and index stages during a conflict
+  (`git show :2:<path>` / `:3:<path>`) — all exactly as the system git
+  implements them. A Go git library would mean re-implementing or
+  approximating that behavior; shelling out gets it for free and stays
   compatible with whatever git version and config (credential helpers,
   hooks) the user already has.
 - **`github.com/fsnotify/fsnotify`** for file watching. It's the de facto
@@ -54,13 +54,15 @@ gives (ahead, behind), classified into 4 states with one action each:
 | 0     | 0      | Equal    | no-op               |
 | >0    | 0      | Ahead    | push                |
 | 0     | >0     | Behind   | fast-forward merge  |
-| >0    | >0     | Diverged | rebase, then push   |
+| >0    | >0     | Diverged | merge, then push    |
 
 Before any of this runs, `statemachine.PreCheck` stats `.git/rebase-merge`,
 `.git/rebase-apply`, and `.git/MERGE_HEAD` (following the `gitdir:`
 indirection for worktrees). If any exist, the cycle is skipped entirely —
 gitloop never touches a repository that a human (or another tool) is in the
-middle of operating on.
+middle of operating on. gitloop itself never leaves a rebase in progress
+(it doesn't use `git rebase` at all), so a rebase marker found here always
+means an external tool or a person started one by hand.
 
 Reusing the same cycle (guard -> commit-if-dirty -> fetch -> classify -> act)
 for all three triggers — settle timer, max-wait timer, and the periodic
@@ -70,11 +72,24 @@ separate code path from "the user just saved a file."
 
 ## Conflict flow
 
-`Diverged` maps to `rebase, then push`. If `git rebase` stops on a
-conflict, control passes to `resolveConflicts`:
+`Diverged` maps to `merge, then push`. gitloop never uses `git rebase` or
+`git reset --hard`: a vault-app contract this daemon must respect forbids
+rewriting history internally, and `reset --hard` in particular used to
+discard every local commit down to upstream on a conflict — including
+commits to files that had nothing to do with the conflict. A merge only
+ever touches the files it can't auto-resolve, so non-conflicting local
+commits are always preserved as part of the merge commit.
+
+`git merge --no-ff --no-edit <upstream>` either fast-forwards (never
+actually reachable here, since Diverged means neither side is an ancestor
+of the other; `--no-ff` just makes that explicit so git doesn't ask which
+mode was intended) or creates a merge commit. If it stops on a conflict,
+control passes to `resolveConflicts`, which — unlike a rebase, where each
+replayed commit can conflict in turn — sees every conflicting file in one
+shot and resolves the whole set in a single pass:
 
 ```
-rebase reports conflict
+merge reports conflict
         │
         ▼
 policy == claude AND claude CLI + ANTHROPIC_API_KEY available?
@@ -90,37 +105,38 @@ check markers gone, `git add`
    yes       no
     │        │
     ▼        ▼
-`git rebase --continue`          back up ours/theirs per file,
-(loop if it conflicts again)     `git rebase --abort`,
-    │                            `git reset --hard <upstream>`,
-    ▼                            commit the backup files
-   push
+commit the merge               back up ours/theirs per file,
+                                `git checkout --theirs` + `git add` each,
+                                commit the merge
+    │                               │
+    ▼                               ▼
+   push  ◄────────────────────────────
 ```
 
-**Why reset to upstream after a backup, instead of just aborting:**
-`git rebase --abort` alone restores the branch to exactly the diverged
-state it was in before the attempt. The next cycle would fetch the same
-upstream, see the same Diverged state, hit the identical conflict, and back
-it up again — forever, piling up a new pair of `.conflict.*` files every
-cycle. This was caught during manual end-to-end testing (see
-`internal/daemon/conflict_test.go`,
-`TestResolveConflictsBackupPolicyResetsToUpstream`). Resetting the branch to
-upstream after the backup discards the conflicting local commit from
-history — but nothing is actually lost: both sides' content is preserved in
-the backup files (and the discarded commit is still reachable via
-`git reflog` for anyone who wants it), and the repository reaches a stable,
-non-conflicting state instead of retrying forever.
+**Why accept theirs instead of ours:** upstream has already been pushed and
+may be visible to other devices, so it's the version of record; the local
+("ours") side is still-unshared and would otherwise be silently discarded
+by taking upstream's content, so it's rescued into a backup file instead.
+Nothing is lost either way: both sides' content is preserved in the backup
+files, and the commit that introduced the local side stays reachable in
+`git log`/`git reflog`. This also keeps the repository from re-diverging —
+because the merge (with theirs accepted) actually completes and gets
+pushed, the next cycle sees a clean Equal/Ahead state instead of hitting
+the identical conflict again.
 
-**Ours vs. theirs naming**: during a rebase, git's convention is inverted
-from a merge — "ours" (index stage 2) is the commit being rebased *onto*
-(i.e. upstream), "theirs" (stage 3) is the local commit being replayed. The
+**Ours vs. theirs naming**: during a merge (unlike a rebase, where the
+convention is inverted), "ours" (index stage 2) is the local branch and
+"theirs" (stage 3) is the branch being merged in — i.e. upstream. The
 backup filenames follow that same convention, since they come straight from
 `git show :2:<path>` / `:3:<path>`.
 
 **Claude availability check requires both** `ANTHROPIC_API_KEY` being set
 and `claude` being on `PATH`. Either missing means the `claude` policy is
 treated as unavailable for that cycle and falls back to `backup` — it never
-partially attempts a claude resolution.
+partially attempts a claude resolution. Either path finishes with a plain
+`git commit` (not `git merge --continue` — they're equivalent once
+`MERGE_HEAD` exists and the index is fully staged, but `commit` lets
+gitloop supply its own message).
 
 ## launchd agent
 

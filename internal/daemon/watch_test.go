@@ -60,10 +60,9 @@ func (f *fakeGit) Fetch(string) error                                     { retu
 func (f *fakeGit) CurrentBranch() (string, error)                         { return "main", nil }
 func (f *fakeGit) RevListLeftRightCount(string, string) (int, int, error) { return 0, 0, nil }
 func (f *fakeGit) MergeFF(string) error                                   { return nil }
-func (f *fakeGit) Rebase(string) (bool, error)                            { return false, nil }
-func (f *fakeGit) RebaseContinue() (bool, error)                          { return false, nil }
-func (f *fakeGit) RebaseAbort() error                                     { return nil }
-func (f *fakeGit) ResetHard(string) error                                 { return nil }
+func (f *fakeGit) Merge(string) (bool, error)                             { return false, nil }
+func (f *fakeGit) MergeAbort() error                                      { return nil }
+func (f *fakeGit) CheckoutTheirs(string) error                            { return nil }
 func (f *fakeGit) Push(string, string) error                              { return nil }
 func (f *fakeGit) ConflictedFiles() ([]string, error)                     { return nil, nil }
 func (f *fakeGit) ShowStage(int, string) (string, bool, error)            { return "", false, nil }

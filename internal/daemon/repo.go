@@ -20,7 +20,11 @@ type cycleResult struct {
 	Committed bool
 	Action    statemachine.Action
 	Pushed    bool
-	Err       error
+	// Conflict is true if this cycle hit a merge conflict that was resolved
+	// via the backup policy, leaving unresolved-by-a-human conflict backup
+	// files in the working tree that still need attention.
+	Conflict bool
+	Err      error
 }
 
 // runSyncCycle runs one full sync cycle against git: guard, auto-commit,
@@ -86,21 +90,23 @@ func runSyncCycle(git GitClient, repo config.Repository, hostname string, logger
 			return result
 		}
 
-	case statemachine.RebaseThenPush:
-		conflict, err := git.Rebase(upstream)
+	case statemachine.MergeThenPush:
+		conflict, err := git.Merge(upstream)
 		if err != nil {
-			result.Err = fmt.Errorf("rebase: %w", err)
+			result.Err = fmt.Errorf("merge: %w", err)
 			return result
 		}
 		if conflict {
-			logger.Warn("rebase stopped on a conflict, applying conflict policy", "on_conflict", repo.OnConflict)
-			if completed := resolveConflicts(git, repo.Path, upstream, repo.OnConflict, hostname, logger); !completed {
-				result.Err = fmt.Errorf("rebase conflict was not auto-resolved (backed up and aborted; see logs)")
+			logger.Warn("merge stopped on a conflict, applying conflict policy", "on_conflict", repo.OnConflict)
+			completed, backup := resolveConflicts(git, repo.Path, upstream, repo.OnConflict, hostname, logger)
+			if !completed {
+				result.Err = fmt.Errorf("merge conflict was not auto-resolved (see logs)")
 				return result
 			}
+			result.Conflict = backup
 		}
 		if err := git.Push(repo.Remote, branch); err != nil {
-			result.Err = fmt.Errorf("push after rebase: %w", err)
+			result.Err = fmt.Errorf("push after merge: %w", err)
 			return result
 		}
 		result.Pushed = true
