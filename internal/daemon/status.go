@@ -8,30 +8,63 @@ import (
 	"time"
 )
 
+// Phase values for RepoStatus.Phase.
+const (
+	// PhaseIdle means the repository isn't mid-cycle and has no known
+	// unresolved conflict; it's safe for another process to save into it.
+	PhaseIdle = "idle"
+	// PhaseSyncing means a sync cycle is currently running against the
+	// repository, from the initial fetch through the final push.
+	PhaseSyncing = "syncing"
+	// PhaseConflict means the repository has conflict backup files that
+	// need a human's attention (see internal/daemon/conflict.go), or a
+	// rebase/merge that predates gitloop's own cycle is in progress.
+	PhaseConflict = "conflict"
+)
+
 // RepoStatus is one repository's last-known sync state, as reported by
 // `gitloop status`.
 type RepoStatus struct {
-	Path       string    `json:"path"`
-	LastCommit string    `json:"last_commit,omitempty"`
-	LastPush   string    `json:"last_push,omitempty"`
-	LastError  string    `json:"last_error,omitempty"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	Path string `json:"path"`
+	// Phase is one of PhaseIdle, PhaseSyncing, or PhaseConflict.
+	Phase      string `json:"phase"`
+	LastCommit string `json:"last_commit,omitempty"`
+	LastPush   string `json:"last_push,omitempty"`
+	// LastSuccessfulSyncAt is stamped only when a full cycle (fetch through
+	// push) completes without error, so a long-silent value here — as
+	// opposed to LastError, which only reflects the most recent cycle — is
+	// a sign that syncing has been silently broken (e.g. expired push
+	// credentials) for a while.
+	LastSuccessfulSyncAt time.Time `json:"last_successful_sync_at,omitempty"`
+	LastError            string    `json:"last_error,omitempty"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 // StatusFile is the on-disk shape gitloop writes so `gitloop status` (a
 // separate process) can read it without talking to the running daemon.
 type StatusFile struct {
-	Repos map[string]RepoStatus `json:"repos"`
+	// Pid is the daemon process's own process ID, written once at startup.
+	Pid int `json:"pid"`
+	// LastHeartbeatAt is stamped on a fixed interval by a goroutine
+	// independent of any repository's sync loop (see Daemon.runHeartbeat),
+	// so a consumer of this file can tell the daemon process itself is
+	// still alive — as opposed to merely having synced recently — even
+	// while every repository loop is idle, backed off, or blocked.
+	LastHeartbeatAt time.Time             `json:"last_heartbeat_at"`
+	Repos           map[string]RepoStatus `json:"repos"`
 }
 
 // DefaultStatusPath returns the default location gitloop records status to:
-// ~/Library/Caches/gitloop/status.json.
+// ~/Library/Application Support/gitloop/status.json. Application Support is
+// used rather than ~/Library/Caches because macOS may purge the latter at
+// any time, and this file is meant to be durable enough for another process
+// to rely on for crash/staleness detection.
 func DefaultStatusPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, "Library", "Caches", "gitloop", "status.json"), nil
+	return filepath.Join(home, "Library", "Application Support", "gitloop", "status.json"), nil
 }
 
 // LoadStatusFile reads the status file at path, returning an empty one if it
@@ -96,11 +129,36 @@ func (r *statusRecorder) update(repoPath string, mutate func(*RepoStatus)) error
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	st := r.file.Repos[repoPath]
+	st, seen := r.file.Repos[repoPath]
+	if !seen {
+		st.Phase = PhaseIdle
+	}
 	st.Path = repoPath
 	mutate(&st)
 	st.UpdatedAt = time.Now()
 	r.file.Repos[repoPath] = st
 
+	return r.file.Save(r.path)
+}
+
+// setPid stamps the status file with the daemon's own process ID. It is
+// written once at startup so a consumer can compare it against the live
+// process table to detect a crashed daemon whose last status update is
+// stale.
+func (r *statusRecorder) setPid(pid int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.file.Pid = pid
+	return r.file.Save(r.path)
+}
+
+// heartbeat stamps the current time as the daemon's last-known-alive
+// timestamp.
+func (r *statusRecorder) heartbeat() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.file.LastHeartbeatAt = time.Now()
 	return r.file.Save(r.path)
 }

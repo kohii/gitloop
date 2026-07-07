@@ -41,6 +41,22 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 
 	runCycle := func(trigger string) {
 		logger.Info("running sync cycle", "trigger", trigger)
+
+		lock, ok := acquireSaveLockWithRetry(repo.SaveLockPath, repo.Settle, logger)
+		if !ok {
+			logger.Warn("skipped: save in-flight")
+			if err := recorder.update(repo.Path, func(s *RepoStatus) {
+				s.LastError = "skipped: save in-flight"
+			}); err != nil {
+				logger.Error("writing status file failed", "error", err)
+			}
+			return
+		}
+		defer lock.release()
+
+		if err := recorder.update(repo.Path, func(s *RepoStatus) { s.Phase = PhaseSyncing }); err != nil {
+			logger.Error("writing status file failed", "error", err)
+		}
 		result := runSyncCycle(git, repo, hostname, logger)
 		applyCycleResult(recorder, repo.Path, result, logger)
 	}
@@ -113,20 +129,33 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 
 func applyCycleResult(recorder *statusRecorder, repoPath string, result cycleResult, logger *slog.Logger) {
 	err := recorder.update(repoPath, func(s *RepoStatus) {
-		now := time.Now().Format(time.RFC3339)
+		now := time.Now()
+		nowStr := now.Format(time.RFC3339)
 		if result.Committed {
-			s.LastCommit = now
+			s.LastCommit = nowStr
 		}
 		if result.Pushed {
-			s.LastPush = now
+			s.LastPush = nowStr
 		}
 		switch {
 		case result.Skipped != "":
+			// PreCheck only skips a cycle when it finds a rebase or merge
+			// already in progress — a git-level state that (like a backed
+			// up conflict) needs attention before it's safe to save into
+			// the repository again.
 			s.LastError = "skipped: " + result.Skipped
+			s.Phase = PhaseConflict
 		case result.Err != nil:
 			s.LastError = result.Err.Error()
+			s.Phase = PhaseIdle
 		default:
 			s.LastError = ""
+			s.LastSuccessfulSyncAt = now
+			if result.Conflict {
+				s.Phase = PhaseConflict
+			} else {
+				s.Phase = PhaseIdle
+			}
 		}
 	})
 	if err != nil {

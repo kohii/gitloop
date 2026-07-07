@@ -45,14 +45,17 @@ func statusCmd(args []string, stdout, stderr io.Writer) int {
 	}
 
 	w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "PATH\tLAST_COMMIT\tLAST_PUSH\tLAST_ERROR")
+	fmt.Fprintln(w, "PATH\tPHASE\tLAST_COMMIT\tLAST_PUSH\tLAST_ERROR")
 	for _, repo := range cfg.Repositories {
 		st, ok := sf.Repos[repo.Path]
-		lastCommit, lastPush, lastError := "-", "-", "-"
+		phase, lastCommit, lastPush, lastError := "-", "-", "-", "-"
 		switch {
 		case !ok:
 			lastError = "not yet synced"
 		default:
+			if st.Phase != "" {
+				phase = st.Phase
+			}
 			if st.LastCommit != "" {
 				lastCommit = st.LastCommit
 			}
@@ -63,7 +66,7 @@ func statusCmd(args []string, stdout, stderr io.Writer) int {
 				lastError = st.LastError
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", repo.Path, lastCommit, lastPush, lastError)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", repo.Path, phase, lastCommit, lastPush, lastError)
 	}
 	return flushOrErr(w, stderr)
 }

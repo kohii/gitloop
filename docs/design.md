@@ -20,6 +20,10 @@ generated launchd agent looks like.
 - **`gopkg.in/yaml.v3`** for config parsing. Config is a small, mostly-flat
   structure; a full config framework would be more machinery than the
   problem needs.
+- **`golang.org/x/sys/unix`** for `flock` (`unix.Flock`), used by the save
+  lock (see "Status file" below) to coordinate with another process writing
+  to the same repository. The standard library has no portable advisory
+  file locking primitive.
 
 No other third-party dependencies. `internal/statemachine` and
 `internal/commitmsg` are pure Go with no dependencies at all, by design —
@@ -106,11 +110,10 @@ check markers gone, `git add`
     │        │
     ▼        ▼
 commit the merge               back up ours/theirs per file,
-                                `git checkout --theirs` + `git add` each,
-                                commit the merge
-    │                               │
-    ▼                               ▼
-   push  ◄────────────────────────────
+(phase stays "idle")           `git checkout --theirs` + `git add` each,
+    │                          commit the merge
+    ▼                          (phase becomes "conflict")
+   push  ◄────────────────────────────┘
 ```
 
 **Why accept theirs instead of ours:** upstream has already been pushed and
@@ -178,11 +181,72 @@ and removes the plist.
 
 ## Status file
 
-The daemon writes `~/Library/Caches/gitloop/status.json` after every sync
-cycle (atomically: write to `.tmp`, then rename) so `gitloop status` — a
-separate, short-lived process — can read it without talking to the running
-daemon over IPC. Multiple repositories share one file, keyed by repository
-path, guarded by a mutex inside the daemon process.
+The daemon writes `~/Library/Application Support/gitloop/status.json`
+(atomically: write to `.tmp`, then rename) after every sync cycle, plus on
+a fixed heartbeat independent of any cycle, so `gitloop status` — or any
+other process, e.g. a notes-app server sharing the repository — can read
+gitloop's state without talking to the running daemon over IPC. Multiple
+repositories share one file, keyed by repository path, guarded by a mutex
+inside the daemon process. Application Support is used rather than
+`~/Library/Caches` because macOS may purge the latter at any time, and this
+file needs to be durable enough for another process to rely on it for
+crash/staleness detection.
+
+**Top-level fields** (not per-repository):
+
+- `pid` — the daemon's own process ID, written once at startup.
+- `last_heartbeat_at` — stamped every 5 seconds by `Daemon.runHeartbeat`, a
+  goroutine independent of every repository's watch/sync loop. A consumer
+  combines this with `pid` to tell "gitloop crashed" apart from "gitloop is
+  just idle or backed off": if `last_heartbeat_at` is stale or `pid` no
+  longer exists, treat gitloop as not running regardless of what any
+  individual repository's `phase` last said.
+
+**Per-repository fields** (`repos[<path>]`):
+
+- `phase` — `"idle"`, `"syncing"`, or `"conflict"`. `runRepoLoop` sets
+  `syncing` immediately before a cycle starts (fetch through push) and
+  resolves it to `idle` or `conflict` when the cycle ends — `conflict` if
+  the cycle just committed a backup-and-accept-theirs merge (see "Conflict
+  flow"), or if `PreCheck` found a rebase/merge already in progress;
+  `idle` otherwise, including on a plain error. A writer sharing the
+  repository is expected to treat `syncing`/`conflict` as "don't touch the
+  working tree right now".
+- `last_successful_sync_at` — stamped only when a full cycle (fetch through
+  push, or a no-op because nothing needed syncing) completes without error.
+  Unlike `last_error`, which only reflects the most recent cycle, a
+  long-stale value here is a sign that syncing has quietly stopped working
+  (e.g. expired push credentials) even if nothing is visibly failing loudly.
+- `last_commit` / `last_push` / `last_error` / `updated_at` — unchanged
+  from before: timestamps of the last auto-commit and push, the most recent
+  cycle's error (or a `"skipped: ..."` guard/lock reason), and when the
+  entry was last written.
+
+## Save lock: coordinating with another writer
+
+Some deployments have a second process writing directly to the same
+working tree — for example, a notes-app server handling explicit saves
+while gitloop handles background sync. Both sides need to avoid touching
+the tree at the same time, so gitloop treats an advisory lock file as a
+handshake:
+
+- `Repository.SaveLockPath` (config key `save_lock_path`) defaults to
+  `<repo path>/.notesapp/state/save.lock`; an empty string disables the
+  whole mechanism for repositories with no such external writer.
+- Before each cycle, `runRepoLoop` calls `acquireSaveLockWithRetry`, which
+  tries a non-blocking `flock(LOCK_EX)` on that path (`internal/daemon/savelock.go`).
+  If it's already held — presumably by the other writer, mid-save — gitloop
+  retries a few times (waiting `Settle` between attempts) and then skips
+  the cycle entirely, leaving `last_error` as `"skipped: save in-flight"`
+  without touching `phase`. The next trigger (file change or fetch timer)
+  tries again from scratch.
+- The lock is released as soon as the cycle finishes, before the next
+  trigger's wait begins — it does not stay held for the settle/debounce
+  window itself, only for the git operations.
+- The other writer is expected to hold the same lock (also non-blocking,
+  so it never gets stuck queuing behind gitloop) for the duration of its
+  own writes, and to treat the status file's `phase: syncing`/`conflict` as
+  the reverse signal — "gitloop is mid-write, don't start one of your own".
 
 ## Error isolation
 

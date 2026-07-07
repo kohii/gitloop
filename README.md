@@ -46,9 +46,15 @@ defaults:
   remote: origin
   branch: ""           # empty = whatever is currently checked out
   on_conflict: claude  # "claude" (falls back to "backup") or "backup"
+  save_lock_path: ""   # "" disables save-lock coordination for every repository below
 ```
 
 `~` in `path` is expanded to the user's home directory.
+
+`save_lock_path` defaults to `<path>/.notesapp/state/save.lock` per
+repository — see "Coordinating with another writer" below — and can be
+overridden or set to `""` (disabling it) per repository or for all
+repositories via `defaults`.
 
 ## Usage
 
@@ -70,9 +76,9 @@ runs regardless of how many repositories are configured.
 table:
 
 ```
-PATH                LAST_COMMIT              LAST_PUSH                LAST_ERROR
-/Users/you/notes    2026-07-07T07:07:47+09:00  2026-07-07T07:07:47+09:00  -
-/Users/you/journal  -                          -                          not yet synced
+PATH                PHASE  LAST_COMMIT                LAST_PUSH                  LAST_ERROR
+/Users/you/notes    idle   2026-07-07T07:07:47+09:00  2026-07-07T07:07:47+09:00  -
+/Users/you/journal  -      -                          -                          not yet synced
 ```
 
 ## Sync behavior
@@ -122,16 +128,70 @@ If a merge stops on a real conflict, `on_conflict` decides what happens:
   that introduced it stays in `git log`/`git reflog`) — but reconciling it
   back into the real file is left to you.
 
-Either way, a conflict is logged at `warn`/`error` level; gitloop does not
-retry the same conflict indefinitely.
+Either way, a conflict is logged at `warn`/`error` level, and the
+repository's status is reported as `phase: conflict` (see below) until the
+next successful cycle.
+
+## Status file and coordinating with another writer
+
+gitloop writes `~/Library/Application Support/gitloop/status.json` after
+every sync cycle (and on a 5s heartbeat independent of any cycle), so
+another process — e.g. a notes-app server sharing the same working tree —
+can watch gitloop's state without talking to it directly:
+
+```json
+{
+  "pid": 4242,
+  "last_heartbeat_at": "2026-07-07T15:30:05+09:00",
+  "repos": {
+    "/Users/you/notes": {
+      "path": "/Users/you/notes",
+      "phase": "idle",
+      "last_commit": "2026-07-07T15:30:00+09:00",
+      "last_push": "2026-07-07T15:30:05+09:00",
+      "last_successful_sync_at": "2026-07-07T15:30:05+09:00",
+      "last_error": "",
+      "updated_at": "2026-07-07T15:30:05+09:00"
+    }
+  }
+}
+```
+
+- **`pid`** / **`last_heartbeat_at`** let a consumer tell a crashed gitloop
+  process apart from one that's merely idle: if `last_heartbeat_at` is
+  stale (older than a few heartbeat intervals) or `pid` no longer exists,
+  gitloop isn't running.
+- **`repos[path].phase`** is `"idle"`, `"syncing"` (a cycle is running,
+  fetch through push), or `"conflict"` (conflict backup files are sitting
+  in the working tree, or an external rebase/merge is in progress). A
+  writer sharing the repository should treat `syncing` and `conflict` as
+  "don't touch the working tree right now".
+- **`repos[path].last_successful_sync_at`** only advances when a full cycle
+  completes without error, so a long-stale value — even while `last_error`
+  looks clean — is a sign that syncing has quietly stopped working (e.g.
+  expired push credentials).
+
+### Coordinating with another writer
+
+If some other process also writes directly to a watched repository (not
+through gitloop), both sides need to avoid touching the working tree at the
+same time. gitloop's half of that: before each cycle, it tries a
+non-blocking `flock` on `save_lock_path` (default
+`<repo path>/.notesapp/state/save.lock`); if that fails because the other
+process is holding it, gitloop retries a few times (waiting `settle`
+between attempts) and then skips the cycle for the next trigger to pick up.
+The other process is expected to hold the same lock (also non-blocking) for
+the duration of its own writes, and to treat `phase: syncing` / `conflict`
+in the status file as "gitloop is mid-write, don't start a write of your
+own". Set `save_lock_path: ""` to disable this for a repository with no
+such external writer.
 
 ## Logs
 
 `gitloop run` logs structured (`log/slog`) output to stderr; every
 repository-scoped line carries a `repo=<basename>` attribute. Under
 `gitloop install`, stdout/stderr are redirected to
-`~/Library/Logs/gitloop.log`. Status snapshots are written to
-`~/Library/Caches/gitloop/status.json`.
+`~/Library/Logs/gitloop.log`.
 
 ## License
 

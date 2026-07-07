@@ -33,6 +33,11 @@ type Defaults struct {
 	Remote        string
 	Branch        string
 	OnConflict    OnConflict
+	// SaveLockPath is nil unless the config file's top-level "defaults"
+	// block sets save_lock_path explicitly (including to ""), in which case
+	// it overrides each repository's dynamic per-path default. See
+	// Repository.SaveLockPath.
+	SaveLockPath *string
 }
 
 // builtinDefaults are used for anything the config file's own top-level
@@ -67,6 +72,13 @@ type Repository struct {
 	Branch string
 	// OnConflict selects the conflict-resolution policy.
 	OnConflict OnConflict
+	// SaveLockPath is the advisory lock file gitloop tries to hold (via
+	// flock) before starting each sync cycle, to coordinate with an
+	// external process (e.g. a notes-app server) that may be mid-save on
+	// the same working tree. It defaults to
+	// "<repo path>/.notesapp/state/save.lock"; an empty string disables the
+	// coordination entirely, for repositories with no such external writer.
+	SaveLockPath string
 }
 
 // Config is gitloop's fully resolved configuration: every repository has all
@@ -85,22 +97,24 @@ type rawConfig struct {
 }
 
 type rawRepository struct {
-	Path          string `yaml:"path"`
-	Settle        string `yaml:"settle"`
-	MaxWait       string `yaml:"max_wait"`
-	FetchInterval string `yaml:"fetch_interval"`
-	Remote        string `yaml:"remote"`
-	Branch        string `yaml:"branch"`
-	OnConflict    string `yaml:"on_conflict"`
+	Path          string  `yaml:"path"`
+	Settle        string  `yaml:"settle"`
+	MaxWait       string  `yaml:"max_wait"`
+	FetchInterval string  `yaml:"fetch_interval"`
+	Remote        string  `yaml:"remote"`
+	Branch        string  `yaml:"branch"`
+	OnConflict    string  `yaml:"on_conflict"`
+	SaveLockPath  *string `yaml:"save_lock_path"`
 }
 
 type rawDefaults struct {
-	Settle        string `yaml:"settle"`
-	MaxWait       string `yaml:"max_wait"`
-	FetchInterval string `yaml:"fetch_interval"`
-	Remote        string `yaml:"remote"`
-	Branch        string `yaml:"branch"`
-	OnConflict    string `yaml:"on_conflict"`
+	Settle        string  `yaml:"settle"`
+	MaxWait       string  `yaml:"max_wait"`
+	FetchInterval string  `yaml:"fetch_interval"`
+	Remote        string  `yaml:"remote"`
+	Branch        string  `yaml:"branch"`
+	OnConflict    string  `yaml:"on_conflict"`
+	SaveLockPath  *string `yaml:"save_lock_path"`
 }
 
 // Load reads, parses, and validates the gitloop config file at path.
@@ -167,6 +181,7 @@ func resolveDefaults(raw rawDefaults) (Defaults, error) {
 		}
 		d.OnConflict = oc
 	}
+	d.SaveLockPath = raw.SaveLockPath
 	return d, nil
 }
 
@@ -211,8 +226,25 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 		}
 		repo.OnConflict = oc
 	}
+	repo.SaveLockPath = resolveSaveLockPath(raw.SaveLockPath, defaults.SaveLockPath, path)
 
 	return repo, nil
+}
+
+// resolveSaveLockPath applies save_lock_path's three-level precedence: an
+// explicit per-repository value (raw, including an explicit "" to disable)
+// wins; failing that, an explicit defaults-block value (fallback) wins;
+// failing that, the dynamic per-repository default is used. A plain string
+// default can't represent "unset" here because "" is itself a meaningful,
+// explicit value (disable locking), hence the pointer inputs.
+func resolveSaveLockPath(raw, fallback *string, repoPath string) string {
+	if raw != nil {
+		return *raw
+	}
+	if fallback != nil {
+		return *fallback
+	}
+	return filepath.Join(repoPath, ".notesapp", "state", "save.lock")
 }
 
 func parseDurationOr(raw string, fallback time.Duration, field string) (time.Duration, error) {

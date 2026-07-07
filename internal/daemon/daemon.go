@@ -18,19 +18,23 @@ const (
 	initialBackoff = 30 * time.Second
 	// maxBackoff caps the exponential backoff between retries.
 	maxBackoff = 10 * time.Minute
+	// heartbeatInterval is how often the daemon stamps the status file's
+	// LastHeartbeatAt, independent of any repository's own sync cycle.
+	heartbeatInterval = 5 * time.Second
 )
 
 // Daemon watches every configured repository and keeps it synced with its
 // remote. Each repository runs in its own goroutine so that one
 // repository's failure (panic or repeated error) never affects the others.
 type Daemon struct {
-	cfg            *config.Config
-	logger         *slog.Logger
-	statusPath     string
-	hostname       string
-	gitFor         gitFactory
-	initialBackoff time.Duration
-	maxBackoff     time.Duration
+	cfg               *config.Config
+	logger            *slog.Logger
+	statusPath        string
+	hostname          string
+	gitFor            gitFactory
+	initialBackoff    time.Duration
+	maxBackoff        time.Duration
+	heartbeatInterval time.Duration
 }
 
 // Option configures a Daemon constructed with New.
@@ -61,6 +65,13 @@ func withBackoff(initial, max time.Duration) Option {
 	return func(d *Daemon) { d.initialBackoff = initial; d.maxBackoff = max }
 }
 
+// withHeartbeatInterval overrides how often the status file's
+// LastHeartbeatAt is stamped. It exists for tests; production code uses
+// heartbeatInterval.
+func withHeartbeatInterval(interval time.Duration) Option {
+	return func(d *Daemon) { d.heartbeatInterval = interval }
+}
+
 // New builds a Daemon for cfg. It does not start watching until Run is
 // called.
 func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
@@ -70,12 +81,13 @@ func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
 	}
 
 	d := &Daemon{
-		cfg:            cfg,
-		logger:         slog.Default(),
-		hostname:       host,
-		gitFor:         defaultGitFactory,
-		initialBackoff: initialBackoff,
-		maxBackoff:     maxBackoff,
+		cfg:               cfg,
+		logger:            slog.Default(),
+		hostname:          host,
+		gitFor:            defaultGitFactory,
+		initialBackoff:    initialBackoff,
+		maxBackoff:        maxBackoff,
+		heartbeatInterval: heartbeatInterval,
 	}
 	for _, opt := range opts {
 		opt(d)
@@ -92,15 +104,26 @@ func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
 	return d, nil
 }
 
-// Run starts one watch loop per configured repository and blocks until ctx
-// is canceled and every loop has shut down gracefully.
+// Run starts one watch loop per configured repository plus the heartbeat
+// goroutine, and blocks until ctx is canceled and all of them have shut
+// down gracefully.
 func (d *Daemon) Run(ctx context.Context) error {
 	recorder, err := newStatusRecorder(d.statusPath)
 	if err != nil {
 		return fmt.Errorf("daemon: loading status file %s: %w", d.statusPath, err)
 	}
+	if err := recorder.setPid(os.Getpid()); err != nil {
+		d.logger.Error("writing status file failed", "error", err)
+	}
 
 	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.runHeartbeat(ctx, recorder)
+	}()
+
 	for _, repo := range d.cfg.Repositories {
 		wg.Add(1)
 		go func(repo config.Repository) {
@@ -110,6 +133,31 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	wg.Wait()
 	return nil
+}
+
+// runHeartbeat stamps the status file's LastHeartbeatAt every
+// d.heartbeatInterval until ctx is canceled. It runs independently of every
+// repository's watch/sync loop so a consumer of the status file can tell
+// the daemon process itself is alive even while every repository loop is
+// idle, backed off, or blocked on a slow git command.
+func (d *Daemon) runHeartbeat(ctx context.Context, recorder *statusRecorder) {
+	if err := recorder.heartbeat(); err != nil {
+		d.logger.Error("writing status file failed", "error", err)
+	}
+
+	ticker := time.NewTicker(d.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := recorder.heartbeat(); err != nil {
+				d.logger.Error("writing status file failed", "error", err)
+			}
+		}
+	}
 }
 
 // superviseRepo runs repo's watch loop, restarting it with exponential

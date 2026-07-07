@@ -32,6 +32,7 @@ repositories:
 		Remote:        "origin",
 		Branch:        "",
 		OnConflict:    OnConflictClaude,
+		SaveLockPath:  filepath.Join(home, "notes", ".notesapp", "state", "save.lock"),
 	}
 	if got := cfg.Repositories[0]; got != want {
 		t.Errorf("Repositories[0] = %+v, want %+v", got, want)
@@ -75,6 +76,68 @@ defaults:
 	}
 	if second.MaxWait != 60*time.Second {
 		t.Errorf("Repositories[1].MaxWait = %v, want 60s (from defaults)", second.MaxWait)
+	}
+}
+
+func TestParseSaveLockPathDefaultsToDotNotesappUnderRepoPath(t *testing.T) {
+	yaml := []byte(`
+repositories:
+  - path: ~/notes
+`)
+	cfg, err := Parse(yaml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	got := cfg.Repositories[0].SaveLockPath
+	want := filepath.Join(cfg.Repositories[0].Path, ".notesapp", "state", "save.lock")
+	if got != want {
+		t.Errorf("SaveLockPath = %q, want %q", got, want)
+	}
+}
+
+func TestParseSaveLockPathCanBeOverriddenPerRepo(t *testing.T) {
+	yaml := []byte(`
+repositories:
+  - path: ~/notes
+    save_lock_path: /tmp/custom.lock
+`)
+	cfg, err := Parse(yaml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Repositories[0].SaveLockPath; got != "/tmp/custom.lock" {
+		t.Errorf("SaveLockPath = %q, want /tmp/custom.lock", got)
+	}
+}
+
+func TestParseSaveLockPathEmptyStringDisablesIt(t *testing.T) {
+	yaml := []byte(`
+repositories:
+  - path: ~/notes
+    save_lock_path: ""
+`)
+	cfg, err := Parse(yaml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Repositories[0].SaveLockPath; got != "" {
+		t.Errorf("SaveLockPath = %q, want \"\" (disabled)", got)
+	}
+}
+
+func TestParseSaveLockPathFromDefaultsBlock(t *testing.T) {
+	yaml := []byte(`
+repositories:
+  - path: ~/notes
+defaults:
+  save_lock_path: ""
+`)
+	cfg, err := Parse(yaml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Repositories[0].SaveLockPath; got != "" {
+		t.Errorf("SaveLockPath = %q, want \"\" (disabled via defaults block)", got)
 	}
 }
 
