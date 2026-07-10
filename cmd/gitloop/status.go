@@ -12,7 +12,7 @@ import (
 
 // statusPathFunc resolves the status file location. It's a package
 // variable so tests can point it at a temp file instead of the real
-// ~/Library/Caches/gitloop/status.json.
+// ~/Library/Application Support/gitloop/status.json.
 var statusPathFunc = daemon.DefaultStatusPath
 
 func statusCmd(args []string, stdout, stderr io.Writer) int {
