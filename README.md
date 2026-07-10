@@ -64,8 +64,17 @@ gitloop run [--config <path>]        # start the daemon in the foreground
 gitloop install [--config <path>]    # register + start the launchd agent
 gitloop uninstall                    # stop + remove the launchd agent
 gitloop status [--config <path>]     # show each repository's last sync state
+gitloop lock hold <path>             # hold a save-lock on <path> until stdin closes
 gitloop version
 ```
+
+`gitloop lock hold` is a helper for external writers coordinating with
+gitloop via `save_lock_path` (see "Coordinating with another writer" below).
+A caller spawns it as a child process, waits for the line `"acquired\n"` on
+stdout, does its own working-tree writes while the child holds the flock,
+and closes the child's stdin (or exits, killing it) to release. Because the
+flock is bound to the file descriptor, an unclean exit still releases the
+lock — no cleanup handler needed on the caller side.
 
 `gitloop install` writes `~/Library/LaunchAgents/dev.kohii.gitloop.plist`
 (pointing at the `gitloop` binary's absolute path and the given `--config`)
@@ -128,7 +137,12 @@ If a merge stops on a real conflict, `on_conflict` decides what happens:
   `=======` / `>>>>>>>` markers before accepting it. Requires **both**
   `ANTHROPIC_API_KEY` to be set and `claude` to be on `PATH`; if either is
   missing, or claude fails to produce a clean file, gitloop falls back to
-  `backup` automatically. A successful AI resolution's merge commit message
+  `backup` automatically. Under `gitloop install`, `launchd` runs the
+  daemon without the user's shell env — so `ANTHROPIC_API_KEY` needs to
+  live somewhere the plist inherits (e.g. `launchctl setenv
+  ANTHROPIC_API_KEY <value>` in `~/.zprofile`, or the plist's
+  `EnvironmentVariables` block). Otherwise the AI path silently falls
+  back to `backup` on every conflict. A successful AI resolution's merge commit message
   is prefixed with `[ai-resolved]` (the prefix names the outcome, not the
   model, so it stays stable across model changes), e.g.
   `[ai-resolved] [macbook-air] 2026-07-07 15:30 — merged upstream (AI-resolved: notes/todo.md)` —

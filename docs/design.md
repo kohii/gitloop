@@ -256,20 +256,46 @@ handshake:
 - `Repository.SaveLockPath` (config key `save_lock_path`) defaults to
   `<repo path>/.notesapp/state/save.lock`; an empty string disables the
   whole mechanism for repositories with no such external writer.
-- Before each cycle, `runRepoLoop` calls `acquireSaveLockWithRetry`, which
-  tries a non-blocking `flock(LOCK_EX)` on that path (`internal/daemon/savelock.go`).
-  If it's already held — presumably by the other writer, mid-save — gitloop
-  retries a few times (waiting `Settle` between attempts) and then skips
-  the cycle entirely, leaving `last_error` as `"skipped: save in-flight"`
-  without touching `phase`. The next trigger (file change or fetch timer)
-  tries again from scratch.
-- The lock is released as soon as the cycle finishes, before the next
-  trigger's wait begins — it does not stay held for the settle/debounce
-  window itself, only for the git operations.
+- Each cycle is split by `runRepoLoop` into three phases so the save lock
+  is only held for the part that actually touches the working tree:
+    1. **Pre-fetch (no lock)**: `PreCheck` + `git fetch`. Fetch is a network
+       round-trip that only writes under `.git/`, so blocking an external
+       writer on it would be pure latency for no safety win.
+    2. **Commit + integrate (lock held)**: acquire the save lock via
+       `acquireSaveLockWithRetry` (`internal/daemon/savelock.go`);
+       auto-commit any dirty changes, classify against the freshly fetched
+       upstream, and merge or fast-forward if the local branch is behind
+       or diverged (running the conflict-resolution policy on a conflict).
+       Every step here writes to the index or the working tree, so the
+       lock is what keeps an external writer out.
+    3. **Push (lock released)**: push if the state was Ahead or Diverged.
+       Like fetch, this is network I/O that doesn't touch the working
+       tree; holding the lock across a slow push would just delay the
+       external writer.
+- If the save lock is held by the other writer when the commit/integrate
+  phase tries to acquire it, `acquireSaveLockWithRetry` retries a few
+  times (waiting `Settle` between attempts) and then the cycle is skipped
+  entirely, leaving `last_error` as `"skipped: save in-flight"` without
+  touching `phase`. The next trigger (file change or fetch timer) tries
+  again from scratch.
+- `phase` is only advanced to `syncing` once the commit/integrate phase
+  begins — during the pre-fetch phase `phase` stays at its previous
+  resting value (usually `idle`). Combined with the lock narrowing, this
+  keeps status.json's `syncing` signal aligned with the interval when an
+  external writer actually needs to stay out of the tree.
+- The lock is released as soon as the commit/integrate phase finishes; it
+  does not stay held during the push phase or the settle/debounce window
+  that precedes the next trigger.
 - The other writer is expected to hold the same lock (also non-blocking,
   so it never gets stuck queuing behind gitloop) for the duration of its
-  own writes, and to treat the status file's `phase: syncing`/`conflict` as
-  the reverse signal — "gitloop is mid-write, don't start one of your own".
+  own writes. `gitloop lock hold <path>` (`cmd/gitloop/lock.go`) is a
+  ready-made helper for that: the external writer spawns it as a child
+  process, waits for the line `"acquired\n"` on stdout, does its writes,
+  and closes the child's stdin (or exits) to release. The flock is bound
+  to the file descriptor, so an unclean exit still frees it. The other
+  writer should also treat the status file's `phase: syncing`/`conflict`
+  as the reverse signal — "gitloop is mid-write, don't start one of your
+  own".
 
 ## Error isolation
 

@@ -27,37 +27,50 @@ type cycleResult struct {
 	Err      error
 }
 
-// runSyncCycle runs one full sync cycle against git: guard, auto-commit,
-// fetch, classify, act. It never panics; git/filesystem failures are
-// reported via cycleResult.Err instead so the caller can log and continue
-// rather than crash the watch loop.
-func runSyncCycle(git GitClient, repo config.Repository, hostname string, logger *slog.Logger, recorder *statusRecorder) cycleResult {
+// runPreFetchPhase runs the read-only opening of a sync cycle: PreCheck plus
+// git fetch. It never touches the working tree, so the caller runs it before
+// (and outside of) the save lock. proceed is false when the cycle should
+// stop right here — the returned cycleResult already carries the Skipped or
+// Err to surface, and no further phases should run.
+func runPreFetchPhase(git GitClient, repo config.Repository, logger *slog.Logger) (result cycleResult, proceed bool) {
 	guard, err := statemachine.PreCheck(repo.Path)
 	if err != nil {
-		return cycleResult{Err: fmt.Errorf("precheck: %w", err)}
+		return cycleResult{Err: fmt.Errorf("precheck: %w", err)}, false
 	}
 	if !guard.Safe {
 		logger.Warn("skipping sync cycle: repository has a rebase/merge in progress", "reason", guard.Reason)
-		return cycleResult{Skipped: guard.Reason}
+		return cycleResult{Skipped: guard.Reason}, false
 	}
+	if err := git.Fetch(repo.Remote); err != nil {
+		return cycleResult{Err: fmt.Errorf("fetch: %w", err)}, false
+	}
+	return cycleResult{}, true
+}
 
+// runCommitAndIntegratePhase performs every working-tree-touching step of a
+// sync cycle: auto-commit dirty changes, classify against the freshly fetched
+// upstream, and merge or fast-forward if the local branch is behind or
+// diverged (running the conflict-resolution policy if the merge stops on a
+// conflict). It never pushes — pushing is network I/O the caller should run
+// outside the save lock. When needPush is true, the caller should push
+// repo.Remote/branch (the branch here is the effective one, so an empty
+// repo.Branch has already been resolved to the currently-checked-out branch).
+//
+// The caller is expected to hold the save lock across this phase.
+func runCommitAndIntegratePhase(git GitClient, repo config.Repository, hostname string, logger *slog.Logger, recorder *statusRecorder) (result cycleResult, branch string, needPush bool) {
 	committed, err := commitIfDirty(git, hostname, logger)
 	if err != nil {
-		return cycleResult{Err: fmt.Errorf("auto-commit: %w", err)}
+		result.Err = fmt.Errorf("auto-commit: %w", err)
+		return
 	}
-	result := cycleResult{Committed: committed}
+	result.Committed = committed
 
-	if err := git.Fetch(repo.Remote); err != nil {
-		result.Err = fmt.Errorf("fetch: %w", err)
-		return result
-	}
-
-	branch := repo.Branch
+	branch = repo.Branch
 	if branch == "" {
 		b, err := git.CurrentBranch()
 		if err != nil {
 			result.Err = fmt.Errorf("current branch: %w", err)
-			return result
+			return
 		}
 		branch = b
 	}
@@ -66,7 +79,7 @@ func runSyncCycle(git GitClient, repo config.Repository, hostname string, logger
 	ahead, behind, err := git.RevListLeftRightCount(branch, upstream)
 	if err != nil {
 		result.Err = fmt.Errorf("rev-list: %w", err)
-		return result
+		return
 	}
 	state := statemachine.Classify(ahead, behind)
 	action := statemachine.ActionFor(state)
@@ -78,41 +91,32 @@ func runSyncCycle(git GitClient, repo config.Repository, hostname string, logger
 		// Nothing to do.
 
 	case statemachine.Push:
-		if err := git.Push(repo.Remote, branch); err != nil {
-			result.Err = fmt.Errorf("push: %w", err)
-			return result
-		}
-		result.Pushed = true
+		needPush = true
 
 	case statemachine.FastForwardMerge:
 		if err := git.MergeFF(upstream); err != nil {
 			result.Err = fmt.Errorf("fast-forward merge: %w", err)
-			return result
+			return
 		}
 
 	case statemachine.MergeThenPush:
 		conflict, err := git.Merge(upstream)
 		if err != nil {
 			result.Err = fmt.Errorf("merge: %w", err)
-			return result
+			return
 		}
 		if conflict {
 			logger.Warn("merge stopped on a conflict, applying conflict policy", "on_conflict", repo.OnConflict)
 			completed, backup := resolveConflicts(git, repo.Path, upstream, repo.OnConflict, hostname, logger, recorder)
 			if !completed {
 				result.Err = fmt.Errorf("merge conflict was not auto-resolved (see logs)")
-				return result
+				return
 			}
 			result.Conflict = backup
 		}
-		if err := git.Push(repo.Remote, branch); err != nil {
-			result.Err = fmt.Errorf("push after merge: %w", err)
-			return result
-		}
-		result.Pushed = true
+		needPush = true
 	}
-
-	return result
+	return
 }
 
 // commitIfDirty stages and commits any pending working-tree changes. It

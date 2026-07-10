@@ -42,6 +42,18 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 	runCycle := func(trigger string) {
 		logger.Info("running sync cycle", "trigger", trigger)
 
+		// PreCheck + fetch are safe outside the save lock: they never write
+		// to the working tree (fetch only writes under .git/), and holding
+		// the lock across fetch would block any external writer for the full
+		// duration of a network round-trip.
+		result, proceed := runPreFetchPhase(git, repo, logger)
+		if !proceed {
+			applyCycleResult(recorder, repo.Path, result, logger)
+			return
+		}
+
+		// From here on the cycle touches the working tree (auto-commit,
+		// merge, conflict resolution), so we need to be the sole writer.
 		lock, ok := acquireSaveLockWithRetry(repo.SaveLockPath, repo.Settle, logger)
 		if !ok {
 			logger.Warn("skipped: save in-flight")
@@ -52,12 +64,29 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			}
 			return
 		}
-		defer lock.release()
 
+		// Report `syncing` only now, when we actually start writing — a
+		// consumer of status.json watches this to know when to keep out of
+		// the working tree, and fetch (still `idle`) doesn't need that
+		// exclusion.
 		if err := recorder.update(repo.Path, func(s *RepoStatus) { s.Phase = PhaseSyncing }); err != nil {
 			logger.Error("writing status file failed", "error", err)
 		}
-		result := runSyncCycle(git, repo, hostname, logger, recorder)
+
+		integrateResult, branch, needPush := runCommitAndIntegratePhase(git, repo, hostname, logger, recorder)
+		result = integrateResult
+		lock.release()
+
+		// Push is network I/O, released back outside the lock so an external
+		// writer isn't blocked on a slow remote.
+		if result.Err == nil && needPush {
+			if err := git.Push(repo.Remote, branch); err != nil {
+				result.Err = fmt.Errorf("push: %w", err)
+			} else {
+				result.Pushed = true
+			}
+		}
+
 		applyCycleResult(recorder, repo.Path, result, logger)
 	}
 
@@ -118,7 +147,7 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			runCycle("max-wait")
 
 		case <-fetchTicker.C:
-			// The commit step inside runSyncCycle is a no-op on a clean
+			// The commit step in the integrate phase is a no-op on a clean
 			// working tree, so reusing the same cycle here naturally gives
 			// us "fetch, and integrate if behind/diverged" without a
 			// separate code path.

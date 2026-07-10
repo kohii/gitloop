@@ -23,6 +23,7 @@ Commands:
   install     Install and start the launchd agent
   uninstall   Stop and remove the launchd agent
   status      Show each configured repository's last known sync state
+  lock        Advisory-lock helpers for external writers (see "gitloop lock -h")
   version     Print the version and exit
 
 Use "gitloop <command> -h" for details on a command.
@@ -54,6 +55,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return uninstallCmd(rest, stdout, stderr)
 	case "status":
 		return statusCmd(rest, stdout, stderr)
+	case "lock":
+		return lockCmd(rest, os.Stdin, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "gitloop: unknown command %q\n\n%s", cmd, usage)
 		return 1

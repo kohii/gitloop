@@ -233,6 +233,92 @@ func TestRunRepoLoopSkipsCycleWhileSaveLockIsHeldElsewhere(t *testing.T) {
 	}
 }
 
+// callbackFakeGit wraps fakeGit and lets a test observe the moment fetch is
+// called. It exists so a test can assert what the surrounding save-lock state
+// looks like *during* fetch, without racing on wall-clock timing.
+type callbackFakeGit struct {
+	*fakeGit
+	onFetch func()
+}
+
+func (f *callbackFakeGit) Fetch(remote string) error {
+	if f.onFetch != nil {
+		f.onFetch()
+	}
+	return f.fakeGit.Fetch(remote)
+}
+
+// TestRunRepoLoopDoesNotHoldSaveLockDuringFetch pins the "fetch is outside
+// the save lock" invariant. If a future refactor slid fetch back inside the
+// lock window, tryAcquireSaveLock here would observe the lock as held and
+// this test would fail — the whole point of narrowing the lock is that
+// external writers aren't blocked on gitloop's network round-trip.
+func TestRunRepoLoopDoesNotHoldSaveLockDuringFetch(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "save.lock")
+
+	observed := make(chan bool, 8)
+	git := &callbackFakeGit{
+		fakeGit: &fakeGit{},
+		onFetch: func() {
+			l, ok, err := tryAcquireSaveLock(lockPath)
+			free := err == nil && ok
+			if ok {
+				l.release()
+			}
+			select {
+			case observed <- free:
+			default:
+			}
+		},
+	}
+
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        20 * time.Millisecond,
+		MaxWait:       2 * time.Second,
+		FetchInterval: time.Hour,
+		Remote:        "origin",
+		Branch:        "main",
+		OnConflict:    config.OnConflictBackup,
+		SaveLockPath:  lockPath,
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(filepath.Join(dir, "status.json"))
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+
+	time.Sleep(50 * time.Millisecond)
+	git.fakeGit.markDirty()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case free := <-observed:
+		if !free {
+			t.Fatal("save lock was held while gitloop was in fetch; it should only be held for the commit/merge phase")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("fetch never ran within timeout")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down within 2s of context cancellation")
+	}
+}
+
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.After(timeout)
