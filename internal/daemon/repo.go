@@ -27,13 +27,14 @@ type cycleResult struct {
 	Err      error
 }
 
-// runPreFetchPhase runs the read-only opening of a sync cycle: PreCheck plus
-// git fetch. It never touches the working tree, so the caller runs it before
-// (and outside of) the save lock. proceed is false when the cycle should
-// stop right here — the returned cycleResult already carries the Skipped or
-// Err to surface, and no further phases should run.
-func runPreFetchPhase(git GitClient, repo config.Repository, logger *slog.Logger) (result cycleResult, proceed bool) {
-	guard, err := statemachine.PreCheck(repo.Path)
+// runPreCheckPhase runs the guard step that opens a sync cycle: is there a
+// rebase or merge already in progress that gitloop should stay out of? It
+// never touches the working tree, so the caller runs it before (and outside
+// of) the save lock. proceed is false when the cycle should stop right here
+// — the returned cycleResult carries the Skipped or Err to surface, and no
+// further phases should run.
+func runPreCheckPhase(repoPath string, logger *slog.Logger) (result cycleResult, proceed bool) {
+	guard, err := statemachine.PreCheck(repoPath)
 	if err != nil {
 		return cycleResult{Err: fmt.Errorf("precheck: %w", err)}, false
 	}
@@ -41,30 +42,34 @@ func runPreFetchPhase(git GitClient, repo config.Repository, logger *slog.Logger
 		logger.Warn("skipping sync cycle: repository has a rebase/merge in progress", "reason", guard.Reason)
 		return cycleResult{Skipped: guard.Reason}, false
 	}
-	if err := git.Fetch(repo.Remote); err != nil {
-		return cycleResult{Err: fmt.Errorf("fetch: %w", err)}, false
-	}
 	return cycleResult{}, true
 }
 
-// runCommitAndIntegratePhase performs every working-tree-touching step of a
-// sync cycle: auto-commit dirty changes, classify against the freshly fetched
-// upstream, and merge or fast-forward if the local branch is behind or
-// diverged (running the conflict-resolution policy if the merge stops on a
-// conflict). It never pushes — pushing is network I/O the caller should run
-// outside the save lock. When needPush is true, the caller should push
-// repo.Remote/branch (the branch here is the effective one, so an empty
-// repo.Branch has already been resolved to the currently-checked-out branch).
-//
-// The caller is expected to hold the save lock across this phase.
-func runCommitAndIntegratePhase(git GitClient, repo config.Repository, hostname string, logger *slog.Logger, recorder *statusRecorder) (result cycleResult, branch string, needPush bool) {
+// runCommitPhase auto-commits any dirty changes in the working tree. It is
+// the minimum useful work of a sync cycle: even when we can't classify or
+// integrate (e.g. fetch failed because the network is down), running this
+// alone keeps local edits from piling up uncommitted while the user is
+// offline. The caller is expected to hold the save lock across this phase.
+func runCommitPhase(git GitClient, hostname string, logger *slog.Logger) (result cycleResult) {
 	committed, err := commitIfDirty(git, hostname, logger)
 	if err != nil {
 		result.Err = fmt.Errorf("auto-commit: %w", err)
 		return
 	}
 	result.Committed = committed
+	return
+}
 
+// runIntegratePhase classifies the local branch against the freshly fetched
+// upstream and merges or fast-forwards if it's behind or diverged (running
+// the conflict-resolution policy if the merge stops on a conflict). It
+// assumes runCommitPhase has already handled any dirty working tree, and
+// leaves pushing to the caller — pushing is network I/O that should run
+// outside the save lock. When needPush is true, the caller should push
+// repo.Remote/branch (the branch here is the effective one, so an empty
+// repo.Branch has already been resolved to the currently-checked-out
+// branch). The caller is expected to hold the save lock across this phase.
+func runIntegratePhase(git GitClient, repo config.Repository, hostname string, logger *slog.Logger, recorder *statusRecorder) (result cycleResult, branch string, needPush bool) {
 	branch = repo.Branch
 	if branch == "" {
 		b, err := git.CurrentBranch()

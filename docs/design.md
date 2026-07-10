@@ -260,14 +260,21 @@ handshake:
   is only held for the part that actually touches the working tree:
     1. **Pre-fetch (no lock)**: `PreCheck` + `git fetch`. Fetch is a network
        round-trip that only writes under `.git/`, so blocking an external
-       writer on it would be pure latency for no safety win.
+       writer on it would be pure latency for no safety win. A failed fetch
+       does *not* abort the cycle: the daemon still acquires the lock and
+       runs the commit phase, so local edits are captured even when the
+       laptop is offline; only the integrate + push phases are skipped in
+       that case, and the fetch error surfaces via `last_error`.
     2. **Commit + integrate (lock held)**: acquire the save lock via
        `acquireSaveLockWithRetry` (`internal/daemon/savelock.go`);
        auto-commit any dirty changes, classify against the freshly fetched
        upstream, and merge or fast-forward if the local branch is behind
        or diverged (running the conflict-resolution policy on a conflict).
        Every step here writes to the index or the working tree, so the
-       lock is what keeps an external writer out.
+       lock is what keeps an external writer out. `lock.release()` runs
+       via `defer` in addition to being called explicitly at the end of
+       the phase, so a panic inside a merge or conflict-resolution step
+       can't leak the flock and deadlock every subsequent cycle.
     3. **Push (lock released)**: push if the state was Ahead or Diverged.
        Like fetch, this is network I/O that doesn't touch the working
        tree; holding the lock across a slow push would just delay the
@@ -280,12 +287,15 @@ handshake:
   again from scratch.
 - `phase` is only advanced to `syncing` once the commit/integrate phase
   begins — during the pre-fetch phase `phase` stays at its previous
-  resting value (usually `idle`). Combined with the lock narrowing, this
-  keeps status.json's `syncing` signal aligned with the interval when an
-  external writer actually needs to stay out of the tree.
+  resting value (usually `idle`). It is dropped back to `idle` the moment
+  the commit/integrate phase releases the lock, *before* the push runs,
+  so an external observer sees `syncing` for exactly the interval an
+  external writer actually needs to stay out of the tree — nothing more.
 - The lock is released as soon as the commit/integrate phase finishes; it
   does not stay held during the push phase or the settle/debounce window
-  that precedes the next trigger.
+  that precedes the next trigger. A push failure surfaces via `last_error`
+  but leaves `phase` at `idle`: the working tree is clean and the next
+  trigger will retry naturally.
 - The other writer is expected to hold the same lock (also non-blocking,
   so it never gets stuck queuing behind gitloop) for the duration of its
   own writes. `gitloop lock hold <path>` (`cmd/gitloop/lock.go`) is a

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,10 +10,28 @@ import (
 	"syscall"
 )
 
+// Exit codes for `gitloop lock hold`. 0 (success) and 2 (usage error, from
+// flag.ContinueOnError below) follow the CLI convention; 1 and 3 are
+// deliberately split so the caller can tell "I lost the race for the lock"
+// (retry with backoff) from "something else went wrong" (surface the error):
+//
+//	1 — I/O or filesystem error (mkdir, open, unexpected flock failure).
+//	3 — lock is already held by another process (EWOULDBLOCK/EAGAIN).
+const (
+	lockHoldExitIOError    = 1
+	lockHoldExitContention = 3
+)
+
 const lockUsage = `gitloop lock coordinates advisory locks with external writers.
 
 Usage:
   gitloop lock hold <path>   Acquire flock on <path>, print "acquired", hold until stdin closes.
+
+Exit codes for "gitloop lock hold":
+  0 - lock acquired and released cleanly.
+  1 - I/O error (couldn't open path, unexpected flock failure).
+  2 - usage error (missing/relative path, unknown flag).
+  3 - lock is already held by another process.
 `
 
 const lockHoldUsage = `gitloop lock hold <path>
@@ -24,6 +43,12 @@ const lockHoldUsage = `gitloop lock hold <path>
   stdin to release. Killing the process also releases the lock via fd close.
 
   <path> must be absolute. The parent directory is created if missing.
+
+  Exit codes:
+    0 - lock acquired and released cleanly (stdin closed).
+    1 - I/O error (couldn't open path, unexpected flock failure).
+    2 - usage error (missing/relative path).
+    3 - lock is already held by another process — the caller can retry.
 `
 
 // lockCmd dispatches "gitloop lock" subcommands. It is separate from lockHoldCmd
@@ -75,12 +100,12 @@ func lockHoldCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		fmt.Fprintf(stderr, "gitloop lock hold: %v\n", err)
-		return 1
+		return lockHoldExitIOError
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		fmt.Fprintf(stderr, "gitloop lock hold: %v\n", err)
-		return 1
+		return lockHoldExitIOError
 	}
 	// f.Close releases the flock via fd close (the primary release path for
 	// crash-safety too). Best-effort — if the caller has already gone we can't
@@ -88,13 +113,19 @@ func lockHoldCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	defer f.Close()
 
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		// LOCK_NB signals "already held" via EWOULDBLOCK/EAGAIN; anything
+		// else is an unexpected failure the caller shouldn't just retry on.
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			fmt.Fprintf(stderr, "gitloop lock hold: lock on %s is already held\n", path)
+			return lockHoldExitContention
+		}
 		fmt.Fprintf(stderr, "gitloop lock hold: could not acquire lock on %s: %v\n", path, err)
-		return 1
+		return lockHoldExitIOError
 	}
 
 	if _, err := io.WriteString(stdout, "acquired\n"); err != nil {
 		fmt.Fprintf(stderr, "gitloop lock hold: writing acquired line: %v\n", err)
-		return 1
+		return lockHoldExitIOError
 	}
 	// os.Stdout is unbuffered on Unix, but be explicit when the caller
 	// happens to be an *os.File so a pipe reader sees the line immediately.

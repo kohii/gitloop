@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -331,5 +332,256 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 			t.Fatal("condition not met before timeout")
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+// fetchErrorFakeGit is a fakeGit whose Fetch always fails. It's used to
+// simulate the offline case where the network round-trip can't reach the
+// upstream.
+type fetchErrorFakeGit struct {
+	*fakeGit
+	err error
+}
+
+func (f *fetchErrorFakeGit) Fetch(string) error { return f.err }
+
+// TestRunRepoLoopCommitsEvenWhenFetchFailsOffline pins the "offline commit"
+// invariant: fetch failure must not skip the auto-commit phase. If a laptop
+// goes offline (or upstream is unreachable), local edits still need to be
+// captured into commits so nothing piles up uncommitted while the user is
+// disconnected; only the integrate + push steps are skipped in that case.
+func TestRunRepoLoopCommitsEvenWhenFetchFailsOffline(t *testing.T) {
+	dir := t.TempDir()
+	statusPath := filepath.Join(dir, "status.json")
+
+	git := &fetchErrorFakeGit{
+		fakeGit: &fakeGit{},
+		err:     fmt.Errorf("dial tcp: no route to host"),
+	}
+
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        20 * time.Millisecond,
+		MaxWait:       2 * time.Second,
+		FetchInterval: time.Hour,
+		Remote:        "origin",
+		Branch:        "main",
+		OnConflict:    config.OnConflictBackup,
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+
+	time.Sleep(50 * time.Millisecond)
+	git.fakeGit.markDirty()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// The commit must land even though fetch failed.
+	waitFor(t, 2*time.Second, func() bool { return git.fakeGit.commitCount() >= 1 })
+
+	// And the fetch failure must surface via LastError, phase resolved to
+	// idle (working tree is clean, next cycle will retry).
+	waitFor(t, 2*time.Second, func() bool {
+		sf, err := LoadStatusFile(statusPath)
+		if err != nil {
+			return false
+		}
+		st := sf.Repos[dir]
+		return strings.HasPrefix(st.LastError, "fetch:") && st.Phase == PhaseIdle
+	})
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down within 2s of context cancellation")
+	}
+}
+
+// panicOnCommitFakeGit is a fakeGit whose Commit panics on first call. It's
+// used to exercise the "panic inside the commit/integrate phase must not
+// leak the save lock" invariant.
+type panicOnCommitFakeGit struct {
+	*fakeGit
+	panicked bool
+}
+
+func (f *panicOnCommitFakeGit) Commit(string) error {
+	f.mu.Lock()
+	if !f.panicked {
+		f.panicked = true
+		f.mu.Unlock()
+		panic("boom: simulated failure during commit phase")
+	}
+	f.mu.Unlock()
+	return f.fakeGit.Commit("")
+}
+
+// TestRunRepoLoopReleasesSaveLockAfterCommitPhasePanic pins the "panic
+// safety net" invariant: if the commit/integrate phase panics mid-flight
+// (e.g. an unexpected bug in merge or conflict-resolution), the deferred
+// release must free the flock so subsequent cycles aren't permanently
+// deadlocked with "skipped: save in-flight".
+func TestRunRepoLoopReleasesSaveLockAfterCommitPhasePanic(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "save.lock")
+
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        20 * time.Millisecond,
+		MaxWait:       2 * time.Second,
+		FetchInterval: time.Hour,
+		Remote:        "origin",
+		Branch:        "main",
+		OnConflict:    config.OnConflictBackup,
+		SaveLockPath:  lockPath,
+	}
+
+	git := &panicOnCommitFakeGit{fakeGit: &fakeGit{}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(filepath.Join(dir, "status.json"))
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() {
+			panicked <- recover() // may deliver nil if no panic, so channel signals completion either way
+		}()
+		_ = runRepoLoop(ctx, git, repo, "test-host", logger, recorder)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	git.fakeGit.markDirty()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case r := <-panicked:
+		if r == nil {
+			t.Fatal("expected panic from runRepoLoop, got clean return")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runRepoLoop did not panic within timeout")
+	}
+
+	// If the defer released the flock as intended, this must succeed.
+	// Retry briefly to tolerate any goroutine-teardown ordering.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		l, ok, err := tryAcquireSaveLock(lockPath)
+		if err == nil && ok {
+			l.release()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("save lock was still held after panic: (%v, %v)", ok, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// aheadPushObserverFakeGit reports the local branch as Ahead so runCycle
+// takes the push path, and lets a test observe the exact moment Push is
+// called (to check surrounding state like status.json's phase).
+type aheadPushObserverFakeGit struct {
+	*fakeGit
+	onPush func()
+}
+
+func (f *aheadPushObserverFakeGit) RevListLeftRightCount(string, string) (int, int, error) {
+	return 1, 0, nil // ahead=1, behind=0 → Ahead → Push
+}
+
+func (f *aheadPushObserverFakeGit) Push(remote, branch string) error {
+	if f.onPush != nil {
+		f.onPush()
+	}
+	return f.fakeGit.Push(remote, branch)
+}
+
+// TestRunRepoLoopPhaseIsIdleDuringPush pins the "phase tracks the lock
+// window, not the whole cycle" invariant: push runs outside the save lock,
+// so an external observer of status.json should see phase = "idle" during
+// the push. Otherwise the syncing signal overstates when the working tree
+// is actually being written to.
+func TestRunRepoLoopPhaseIsIdleDuringPush(t *testing.T) {
+	dir := t.TempDir()
+	statusPath := filepath.Join(dir, "status.json")
+
+	observed := make(chan string, 8)
+	git := &aheadPushObserverFakeGit{
+		fakeGit: &fakeGit{},
+		onPush: func() {
+			sf, err := LoadStatusFile(statusPath)
+			if err != nil {
+				return
+			}
+			select {
+			case observed <- sf.Repos[dir].Phase:
+			default:
+			}
+		},
+	}
+
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        20 * time.Millisecond,
+		MaxWait:       2 * time.Second,
+		FetchInterval: time.Hour,
+		Remote:        "origin",
+		Branch:        "main",
+		OnConflict:    config.OnConflictBackup,
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+
+	time.Sleep(50 * time.Millisecond)
+	git.fakeGit.markDirty()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case phase := <-observed:
+		if phase != PhaseIdle {
+			t.Fatalf("phase observed during push = %q, want %q — push runs outside the lock, so phase should already be idle",
+				phase, PhaseIdle)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("push never ran within timeout")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down within 2s of context cancellation")
 	}
 }

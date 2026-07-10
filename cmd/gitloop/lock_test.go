@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -15,7 +16,9 @@ import (
 // gitloopHelperEnv is the env var that flips this test binary into
 // "act as the gitloop CLI" mode via TestMain re-exec, so the lock-hold
 // subprocess tests can spawn a real gitloop process without a separately
-// built binary. The value is the CLI args, null-separated.
+// built binary. The value is the CLI args, unit-separator-separated
+// (\x1f) — chosen over spaces so path arguments containing spaces stay
+// intact.
 const gitloopHelperEnv = "GITLOOP_TEST_HELPER_ARGS"
 
 func TestMain(m *testing.M) {
@@ -90,7 +93,7 @@ func waitCmd(t *testing.T, cmd *exec.Cmd, timeout time.Duration) int {
 			return 0
 		}
 		var exitErr *exec.ExitError
-		if ok := errorsAs(err, &exitErr); ok {
+		if errors.As(err, &exitErr) {
 			return exitErr.ExitCode()
 		}
 		t.Fatalf("cmd.Wait: %v", err)
@@ -102,17 +105,6 @@ func waitCmd(t *testing.T, cmd *exec.Cmd, timeout time.Duration) int {
 	}
 }
 
-// errorsAs is a tiny stand-in for errors.As so this test file doesn't need
-// yet another import for a one-liner.
-func errorsAs(err error, target **exec.ExitError) bool {
-	e, ok := err.(*exec.ExitError)
-	if !ok {
-		return false
-	}
-	*target = e
-	return true
-}
-
 func TestLockHoldRejectsRelativePath(t *testing.T) {
 	cmd := exec.Command(os.Args[0])
 	cmd.Args = []string{os.Args[0]}
@@ -122,7 +114,7 @@ func TestLockHoldRejectsRelativePath(t *testing.T) {
 		t.Fatalf("expected non-zero exit on relative path, got success (output: %s)", out)
 	}
 	var exitErr *exec.ExitError
-	if ok := errorsAs(err, &exitErr); !ok || exitErr.ExitCode() == 0 {
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() == 0 {
 		t.Fatalf("unexpected error type/code: %v (output: %s)", err, out)
 	}
 }
@@ -146,11 +138,13 @@ func TestLockHoldAcquiresAndBlocksSecondHolder(t *testing.T) {
 	}
 
 	// A second subprocess trying the same path must fail while the first
-	// still holds it.
+	// still holds it. Exit code 3 specifically signals "already held" so the
+	// caller can retry without confusing lock contention for an I/O error.
 	second, stdin2, _ := spawnLockHold(t, path)
 	_ = stdin2.Close()
-	if code := waitCmd(t, second, 3*time.Second); code == 0 {
-		t.Fatalf("second holder exit code = 0, want non-zero while first still holds")
+	if code := waitCmd(t, second, 3*time.Second); code != lockHoldExitContention {
+		t.Fatalf("second holder exit code = %d, want %d (contention) while first still holds",
+			code, lockHoldExitContention)
 	}
 
 	// Releasing via stdin close lets a fresh subprocess acquire the same

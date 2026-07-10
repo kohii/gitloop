@@ -13,6 +13,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/kohii/gitloop/internal/config"
+	"github.com/kohii/gitloop/internal/statemachine"
 )
 
 // runRepoLoop watches repo.Path for file changes and drives the settle /
@@ -46,10 +47,22 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		// to the working tree (fetch only writes under .git/), and holding
 		// the lock across fetch would block any external writer for the full
 		// duration of a network round-trip.
-		result, proceed := runPreFetchPhase(git, repo, logger)
+		result, proceed := runPreCheckPhase(repo.Path, logger)
 		if !proceed {
 			applyCycleResult(recorder, repo.Path, result, logger)
 			return
+		}
+
+		// Fetch failure does not bail us out of the cycle: when the network
+		// is down (laptop offline, upstream unreachable) the daemon must
+		// still auto-commit local edits so they aren't lost while the user
+		// is disconnected. The error is remembered and surfaced via
+		// LastError; integrate + push are skipped because we no longer have
+		// fresh upstream data to classify against.
+		var fetchErr error
+		if err := git.Fetch(repo.Remote); err != nil {
+			fetchErr = fmt.Errorf("fetch: %w", err)
+			logger.Warn("fetch failed; running commit-only cycle", "error", fetchErr)
 		}
 
 		// From here on the cycle touches the working tree (auto-commit,
@@ -64,6 +77,11 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			}
 			return
 		}
+		// Safety net so a panic anywhere in the commit/integrate phase can't
+		// leak the flock and deadlock every subsequent cycle. The explicit
+		// release below is idempotent — this second call is a no-op on the
+		// non-panic path.
+		defer lock.release()
 
 		// Report `syncing` only now, when we actually start writing — a
 		// consumer of status.json watches this to know when to keep out of
@@ -73,15 +91,41 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			logger.Error("writing status file failed", "error", err)
 		}
 
-		integrateResult, branch, needPush := runCommitAndIntegratePhase(git, repo, hostname, logger, recorder)
-		result = integrateResult
+		result = runCommitPhase(git, hostname, logger)
+		var branch string
+		var needPush bool
+		if result.Err == nil && fetchErr == nil {
+			integrateResult, b, n := runIntegratePhase(git, repo, hostname, logger, recorder)
+			// Preserve Committed from the commit phase — runIntegratePhase
+			// returns a fresh cycleResult that doesn't know about it.
+			integrateResult.Committed = result.Committed
+			result, branch, needPush = integrateResult, b, n
+		}
+		if result.Err == nil && fetchErr != nil {
+			result.Err = fetchErr
+		}
+
 		lock.release()
 
-		// Push is network I/O, released back outside the lock so an external
-		// writer isn't blocked on a slow remote.
+		// Return phase to idle before push: the working tree is no longer
+		// being touched, so an external writer sharing this repo can safely
+		// proceed. Push is network I/O only.
+		if err := recorder.update(repo.Path, func(s *RepoStatus) { s.Phase = PhaseIdle }); err != nil {
+			logger.Error("writing status file failed", "error", err)
+		}
+
+		// Push is network I/O, run outside the lock so an external writer
+		// isn't blocked on a slow remote.
 		if result.Err == nil && needPush {
 			if err := git.Push(repo.Remote, branch); err != nil {
-				result.Err = fmt.Errorf("push: %w", err)
+				// Preserve the "why are we pushing" context — a push after a
+				// merge commit vs. a bare push of local-only commits are
+				// meaningfully different failures at debug time.
+				if result.Action == statemachine.MergeThenPush {
+					result.Err = fmt.Errorf("push after merge: %w", err)
+				} else {
+					result.Err = fmt.Errorf("push: %w", err)
+				}
 			} else {
 				result.Pushed = true
 			}

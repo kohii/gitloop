@@ -20,15 +20,19 @@ const saveLockRetries = 3
 // value (a nil *saveLock) represents "locking is disabled", and release is
 // safe to call on it.
 type saveLock struct {
-	file *os.File
+	file     *os.File
+	released bool
 }
 
 // release unlocks and closes the underlying file. It is a no-op if locking
-// was disabled (l is nil).
+// was disabled (l is nil) or if release has already been called — the caller
+// can safely both `defer lock.release()` as a panic-safety net and call
+// `lock.release()` explicitly before a non-lock phase (e.g. push).
 func (l *saveLock) release() {
-	if l == nil {
+	if l == nil || l.released {
 		return
 	}
+	l.released = true
 	_ = unix.Flock(int(l.file.Fd()), unix.LOCK_UN)
 	_ = l.file.Close()
 }

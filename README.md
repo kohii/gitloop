@@ -76,6 +76,15 @@ and closes the child's stdin (or exits, killing it) to release. Because the
 flock is bound to the file descriptor, an unclean exit still releases the
 lock — no cleanup handler needed on the caller side.
 
+Exit codes let the caller tell contention apart from real failures:
+
+| code | meaning |
+|-----:|---------|
+| 0    | acquired and released cleanly |
+| 1    | I/O error (couldn't open path, unexpected flock failure) |
+| 2    | usage error (missing/relative path, unknown flag) |
+| 3    | lock already held by another process — caller can retry |
+
 `gitloop install` writes `~/Library/LaunchAgents/dev.kohii.gitloop.plist`
 (pointing at the `gitloop` binary's absolute path and the given `--config`)
 and registers it with `launchctl bootstrap`. The agent restarts gitloop if
