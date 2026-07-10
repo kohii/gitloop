@@ -57,3 +57,33 @@ func TestBuild(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildConflictResolution(t *testing.T) {
+	at := time.Date(2026, 7, 7, 15, 30, 0, 0, time.UTC)
+	files := []string{"a.md", "b.md"}
+
+	cases := []struct {
+		name       string
+		aiResolved bool
+		want       string
+	}{
+		{
+			name:       "AI-resolved merge gets the ai-resolved prefix",
+			aiResolved: true,
+			want:       "[ai-resolved] [macbook-air] 2026-07-07 15:30 — merged upstream (AI-resolved: a.md, b.md)",
+		},
+		{
+			name:       "backup-resolved merge keeps the unprefixed form",
+			aiResolved: false,
+			want:       "[macbook-air] 2026-07-07 15:30 — merged upstream with backups: a.md, b.md",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := BuildConflictResolution("macbook-air", at, files, c.aiResolved); got != c.want {
+				t.Errorf("BuildConflictResolution(...) = %q, want %q", got, c.want)
+			}
+		})
+	}
+}

@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -56,6 +58,19 @@ func (f *fakeConflictGit) ShowStage(stage int, path string) (string, bool, error
 
 var _ GitClient = (*fakeConflictGit)(nil)
 
+// newTestRecorder builds a statusRecorder backed by a status.json under a
+// fresh temp dir, for tests that only care about the RepoStatus fields
+// resolveConflicts writes and don't need to share a directory with the repo
+// under test.
+func newTestRecorder(t *testing.T) *statusRecorder {
+	t.Helper()
+	recorder, err := newStatusRecorder(filepath.Join(t.TempDir(), "status.json"))
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+	return recorder
+}
+
 // TestResolveConflictsBackupPolicyAcceptsTheirs verifies the backup policy's
 // end state: it must not leave the repository re-diverged (which would hit
 // the identical conflict again on the very next cycle), so it accepts the
@@ -72,7 +87,7 @@ func TestResolveConflictsBackupPolicyAcceptsTheirs(t *testing.T) {
 		},
 	}
 
-	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictBackup, "test-host", logger)
+	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictBackup, "test-host", logger, newTestRecorder(t))
 	if !completed {
 		t.Fatal("resolveConflicts() completed = false, want true for the backup policy")
 	}
@@ -125,7 +140,7 @@ func TestResolveConflictsFallsBackToBackupWhenClaudeUnavailable(t *testing.T) {
 		},
 	}
 
-	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictClaude, "test-host", logger)
+	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictClaude, "test-host", logger, newTestRecorder(t))
 	if !completed {
 		t.Fatal("resolveConflicts() completed = false, want true (claude unavailable should fall back to backup)")
 	}
@@ -152,8 +167,14 @@ func TestResolveConflictsWithClaudeSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
 	git := &fakeConflictGit{conflictedFiles: []string{"a.md"}}
-	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictClaude, "test-host", logger)
+	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictClaude, "test-host", logger, recorder)
 	if !completed {
 		t.Fatal("resolveConflicts() completed = false, want true when claude resolves the conflict cleanly")
 	}
@@ -166,7 +187,70 @@ func TestResolveConflictsWithClaudeSucceeds(t *testing.T) {
 	if len(git.addedPaths) != 1 || git.addedPaths[0] != "a.md" {
 		t.Errorf("addedPaths = %v, want [a.md]", git.addedPaths)
 	}
-	if len(git.committed) != 1 || !strings.Contains(git.committed[0], "claude-resolved") {
-		t.Errorf("committed messages = %v, want exactly one mentioning \"claude-resolved\"", git.committed)
+	if len(git.committed) != 1 ||
+		!strings.HasPrefix(git.committed[0], "[ai-resolved] ") ||
+		!strings.Contains(git.committed[0], "AI-resolved") {
+		t.Errorf("committed messages = %v, want exactly one starting with \"[ai-resolved] \" and mentioning \"AI-resolved\"", git.committed)
+	}
+
+	sf, err := LoadStatusFile(statusPath)
+	if err != nil {
+		t.Fatalf("LoadStatusFile: %v", err)
+	}
+	st := sf.Repos[dir]
+	if st.LastAIResolveAt.IsZero() {
+		t.Error("LastAIResolveAt is zero, want it stamped after a successful AI resolution")
+	}
+	if st.LastAIResolveError != "" {
+		t.Errorf("LastAIResolveError = %q, want empty after a successful AI resolution", st.LastAIResolveError)
+	}
+}
+
+// TestResolveConflictsWithClaudeFailureRecordsStatus verifies that a failed
+// AI resolution attempt is recorded in status.json (LastAIResolveError) even
+// though the cycle falls back to the backup policy and still completes —
+// otherwise a silently and repeatedly failing AI path (e.g. an expired
+// ANTHROPIC_API_KEY) would be invisible in `gitloop status`.
+func TestResolveConflictsWithClaudeFailureRecordsStatus(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	origAvailable := isClaudeAvailable
+	isClaudeAvailable = func() bool { return true }
+	defer func() { isClaudeAvailable = origAvailable }()
+
+	origRun := runClaudeOnFile
+	runClaudeOnFile = func(repoPath, file string) error {
+		return fmt.Errorf("claude: token expired")
+	}
+	defer func() { runClaudeOnFile = origRun }()
+
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	git := &fakeConflictGit{
+		conflictedFiles: []string{"a.md"},
+		contents: map[string]map[int]string{
+			"a.md": {2: "ours\n", 3: "theirs\n"},
+		},
+	}
+	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictClaude, "test-host", logger, recorder)
+	if !completed || !backup {
+		t.Fatalf("resolveConflicts() = (%v, %v), want (true, true): a failed AI attempt should fall back to the backup policy", completed, backup)
+	}
+
+	sf, err := LoadStatusFile(statusPath)
+	if err != nil {
+		t.Fatalf("LoadStatusFile: %v", err)
+	}
+	st := sf.Repos[dir]
+	if st.LastAIResolveError == "" {
+		t.Error("LastAIResolveError is empty, want a reason recorded after a failed AI resolution attempt")
+	}
+	if !st.LastAIResolveAt.IsZero() {
+		t.Error("LastAIResolveAt is set, want zero: this AI attempt never succeeded")
 	}
 }

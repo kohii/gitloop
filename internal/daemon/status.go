@@ -37,7 +37,16 @@ type RepoStatus struct {
 	// credentials) for a while.
 	LastSuccessfulSyncAt time.Time `json:"last_successful_sync_at,omitempty"`
 	LastError            string    `json:"last_error,omitempty"`
-	UpdatedAt            time.Time `json:"updated_at"`
+	// LastAIResolveAt is stamped when the AI (on_conflict: claude) path last
+	// resolved a conflict successfully. Unlike LastError, which reflects only
+	// the most recent whole cycle, this lets a long silence in AI resolution
+	// specifically be told apart from other cycle failures — e.g. a launchd
+	// process that keeps running but has lost a valid ANTHROPIC_API_KEY.
+	LastAIResolveAt time.Time `json:"last_ai_resolve_at,omitempty"`
+	// LastAIResolveError is why the most recent AI conflict-resolution
+	// attempt failed. It's reset to "" the next time AI resolution succeeds.
+	LastAIResolveError string    `json:"last_ai_resolve_error,omitempty"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // StatusFile is the on-disk shape gitloop writes so `gitloop status` (a
@@ -139,6 +148,25 @@ func (r *statusRecorder) update(repoPath string, mutate func(*RepoStatus)) error
 	r.file.Repos[repoPath] = st
 
 	return r.file.Save(r.path)
+}
+
+// recordAIResolveSuccess stamps LastAIResolveAt and clears any prior
+// LastAIResolveError for repoPath, marking the AI conflict-resolution path
+// as having just succeeded.
+func (r *statusRecorder) recordAIResolveSuccess(repoPath string) error {
+	return r.update(repoPath, func(s *RepoStatus) {
+		s.LastAIResolveAt = time.Now()
+		s.LastAIResolveError = ""
+	})
+}
+
+// recordAIResolveFailure stamps LastAIResolveError with reason for repoPath.
+// LastAIResolveAt is left untouched, so a past success isn't erased by a
+// later failed attempt.
+func (r *statusRecorder) recordAIResolveFailure(repoPath, reason string) error {
+	return r.update(repoPath, func(s *RepoStatus) {
+		s.LastAIResolveError = reason
+	})
 }
 
 // setPid stamps the status file with the daemon's own process ID. It is

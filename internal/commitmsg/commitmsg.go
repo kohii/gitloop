@@ -86,3 +86,24 @@ func formatKind(k Kind, paths []string) string {
 	sample := strings.Join(paths[:maxListedPerKind], ", ")
 	return fmt.Sprintf("%s %d files (%s, ...)", label, len(paths), sample)
 }
+
+// BuildConflictResolution renders the merge commit message for a conflict
+// that gitloop resolved automatically instead of stopping for a human.
+//
+// aiResolved distinguishes an AI-resolved merge with a fixed "[ai-resolved]"
+// prefix, so such commits stay identifiable in git history no matter which
+// model resolved them — e.g.:
+//
+//	[ai-resolved] [macbook-air] 2026-07-07 15:30 — merged upstream (AI-resolved: a.md, b.md)
+//
+// A non-AI (backup policy) resolution keeps the older, unprefixed form:
+//
+//	[macbook-air] 2026-07-07 15:30 — merged upstream with backups: a.md, b.md
+func BuildConflictResolution(host string, at time.Time, files []string, aiResolved bool) string {
+	header := fmt.Sprintf("[%s] %s", host, at.Format("2006-01-02 15:04"))
+	joined := strings.Join(files, ", ")
+	if aiResolved {
+		return fmt.Sprintf("[ai-resolved] %s — merged upstream (AI-resolved: %s)", header, joined)
+	}
+	return fmt.Sprintf("%s — merged upstream with backups: %s", header, joined)
+}

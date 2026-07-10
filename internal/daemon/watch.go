@@ -57,7 +57,7 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		if err := recorder.update(repo.Path, func(s *RepoStatus) { s.Phase = PhaseSyncing }); err != nil {
 			logger.Error("writing status file failed", "error", err)
 		}
-		result := runSyncCycle(git, repo, hostname, logger)
+		result := runSyncCycle(git, repo, hostname, logger, recorder)
 		applyCycleResult(recorder, repo.Path, result, logger)
 	}
 

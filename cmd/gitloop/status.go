@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"text/tabwriter"
+	"time"
 
 	"github.com/kohii/gitloop/internal/config"
 	"github.com/kohii/gitloop/internal/daemon"
@@ -45,10 +46,10 @@ func statusCmd(args []string, stdout, stderr io.Writer) int {
 	}
 
 	w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "PATH\tPHASE\tLAST_COMMIT\tLAST_PUSH\tLAST_ERROR")
+	fmt.Fprintln(w, "PATH\tPHASE\tLAST_COMMIT\tLAST_PUSH\tLAST_ERROR\tLAST_AI_RESOLVE")
 	for _, repo := range cfg.Repositories {
 		st, ok := sf.Repos[repo.Path]
-		phase, lastCommit, lastPush, lastError := "-", "-", "-", "-"
+		phase, lastCommit, lastPush, lastError, lastAIResolve := "-", "-", "-", "-", "-"
 		switch {
 		case !ok:
 			lastError = "not yet synced"
@@ -65,8 +66,17 @@ func statusCmd(args []string, stdout, stderr io.Writer) int {
 			if st.LastError != "" {
 				lastError = st.LastError
 			}
+			// An outstanding AI-resolve error takes priority over the last
+			// success time: it's the more actionable, silent-failure signal
+			// this column exists for.
+			switch {
+			case st.LastAIResolveError != "":
+				lastAIResolve = "error: " + st.LastAIResolveError
+			case !st.LastAIResolveAt.IsZero():
+				lastAIResolve = st.LastAIResolveAt.Format(time.RFC3339)
+			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", repo.Path, phase, lastCommit, lastPush, lastError)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", repo.Path, phase, lastCommit, lastPush, lastError, lastAIResolve)
 	}
 	return flushOrErr(w, stderr)
 }

@@ -31,7 +31,7 @@ type cycleResult struct {
 // fetch, classify, act. It never panics; git/filesystem failures are
 // reported via cycleResult.Err instead so the caller can log and continue
 // rather than crash the watch loop.
-func runSyncCycle(git GitClient, repo config.Repository, hostname string, logger *slog.Logger) cycleResult {
+func runSyncCycle(git GitClient, repo config.Repository, hostname string, logger *slog.Logger, recorder *statusRecorder) cycleResult {
 	guard, err := statemachine.PreCheck(repo.Path)
 	if err != nil {
 		return cycleResult{Err: fmt.Errorf("precheck: %w", err)}
@@ -98,7 +98,7 @@ func runSyncCycle(git GitClient, repo config.Repository, hostname string, logger
 		}
 		if conflict {
 			logger.Warn("merge stopped on a conflict, applying conflict policy", "on_conflict", repo.OnConflict)
-			completed, backup := resolveConflicts(git, repo.Path, upstream, repo.OnConflict, hostname, logger)
+			completed, backup := resolveConflicts(git, repo.Path, upstream, repo.OnConflict, hostname, logger, recorder)
 			if !completed {
 				result.Err = fmt.Errorf("merge conflict was not auto-resolved (see logs)")
 				return result

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kohii/gitloop/internal/commitmsg"
 	"github.com/kohii/gitloop/internal/config"
 )
 
@@ -25,7 +26,7 @@ import (
 //
 // On failure it always leaves the repository in a clean, non-merging state
 // by aborting the merge.
-func resolveConflicts(git GitClient, repoPath, upstream string, policy config.OnConflict, hostname string, logger *slog.Logger) (completed, backup bool) {
+func resolveConflicts(git GitClient, repoPath, upstream string, policy config.OnConflict, hostname string, logger *slog.Logger, recorder *statusRecorder) (completed, backup bool) {
 	files, err := git.ConflictedFiles()
 	if err != nil {
 		logger.Error("listing conflicted files failed", "error", err)
@@ -39,17 +40,16 @@ func resolveConflicts(git GitClient, repoPath, upstream string, policy config.On
 	}
 
 	if policy == config.OnConflictClaude && isClaudeAvailable() {
-		if tryResolveWithClaude(git, repoPath, files, logger) {
-			msg := fmt.Sprintf("[%s] %s — merged upstream (claude-resolved): %s",
-				hostname, time.Now().Format("2006-01-02 15:04"), strings.Join(files, ", "))
+		if tryResolveWithClaude(git, repoPath, files, logger, recorder) {
+			msg := commitmsg.BuildConflictResolution(hostname, time.Now(), files, true)
 			if err := git.Commit(msg); err != nil {
-				logger.Error("committing claude-resolved merge failed", "error", err)
+				logger.Error("committing AI-resolved merge failed", "error", err)
 				abortMerge(git, logger)
 				return false, false
 			}
 			return true, false
 		}
-		logger.Warn("claude conflict resolution failed, falling back to backup policy", "files", files)
+		logger.Warn("AI conflict resolution failed, falling back to backup policy", "files", files)
 	} else if policy == config.OnConflictClaude {
 		logger.Warn("on_conflict is \"claude\" but the claude CLI or ANTHROPIC_API_KEY is unavailable, falling back to backup policy")
 	}
@@ -96,22 +96,38 @@ var runClaudeOnFile = func(repoPath, file string) error {
 	return cmd.Run()
 }
 
-func tryResolveWithClaude(git GitClient, repoPath string, files []string, logger *slog.Logger) bool {
+func tryResolveWithClaude(git GitClient, repoPath string, files []string, logger *slog.Logger, recorder *statusRecorder) bool {
 	for _, f := range files {
 		if err := runClaudeOnFile(repoPath, f); err != nil {
 			logger.Warn("claude failed while resolving a conflict", "file", f, "error", err)
+			recordAIResolveFailure(recorder, repoPath, fmt.Sprintf("claude failed on %s: %v", f, err), logger)
 			return false
 		}
 		if hasConflictMarkers(filepath.Join(repoPath, f)) {
 			logger.Warn("claude left conflict markers in place", "file", f)
+			recordAIResolveFailure(recorder, repoPath, fmt.Sprintf("claude left conflict markers in %s", f), logger)
 			return false
 		}
 		if err := git.AddPath(f); err != nil {
 			logger.Error("git add after claude resolution failed", "file", f, "error", err)
+			recordAIResolveFailure(recorder, repoPath, fmt.Sprintf("git add after claude resolution failed for %s: %v", f, err), logger)
 			return false
 		}
 	}
+	if err := recorder.recordAIResolveSuccess(repoPath); err != nil {
+		logger.Error("writing status file failed", "error", err)
+	}
 	return true
+}
+
+// recordAIResolveFailure is a small wrapper around
+// statusRecorder.recordAIResolveFailure that logs (rather than propagates) a
+// status-file write error, matching how every other status update in this
+// package treats status reporting as best-effort.
+func recordAIResolveFailure(recorder *statusRecorder, repoPath, reason string, logger *slog.Logger) {
+	if err := recorder.recordAIResolveFailure(repoPath, reason); err != nil {
+		logger.Error("writing status file failed", "error", err)
+	}
 }
 
 func hasConflictMarkers(path string) bool {

@@ -76,9 +76,9 @@ runs regardless of how many repositories are configured.
 table:
 
 ```
-PATH                PHASE  LAST_COMMIT                LAST_PUSH                  LAST_ERROR
-/Users/you/notes    idle   2026-07-07T07:07:47+09:00  2026-07-07T07:07:47+09:00  -
-/Users/you/journal  -      -                          -                          not yet synced
+PATH                PHASE  LAST_COMMIT                LAST_PUSH                  LAST_ERROR      LAST_AI_RESOLVE
+/Users/you/notes    idle   2026-07-07T07:07:47+09:00  2026-07-07T07:07:47+09:00  -               -
+/Users/you/journal  -      -                          -                          not yet synced  -
 ```
 
 ## Sync behavior
@@ -119,7 +119,12 @@ If a merge stops on a real conflict, `on_conflict` decides what happens:
   `=======` / `>>>>>>>` markers before accepting it. Requires **both**
   `ANTHROPIC_API_KEY` to be set and `claude` to be on `PATH`; if either is
   missing, or claude fails to produce a clean file, gitloop falls back to
-  `backup` automatically.
+  `backup` automatically. A successful AI resolution's merge commit message
+  is prefixed with `[ai-resolved]` (the prefix names the outcome, not the
+  model, so it stays stable across model changes), e.g.
+  `[ai-resolved] [macbook-air] 2026-07-07 15:30 — merged upstream (AI-resolved: notes/todo.md)` —
+  so these commits stay identifiable in `git log` later if their content
+  needs a second look.
 - **`backup`**: saves both sides of each conflicted file next to the
   original, e.g. `notes/todo.conflict.macbook-air.20260707153000.ours.md`
   and `...theirs.md`, then accepts the upstream (`theirs`) version of each
@@ -151,6 +156,8 @@ can watch gitloop's state without talking to it directly:
       "last_push": "2026-07-07T15:30:05+09:00",
       "last_successful_sync_at": "2026-07-07T15:30:05+09:00",
       "last_error": "",
+      "last_ai_resolve_at": "2026-07-07T15:29:50+09:00",
+      "last_ai_resolve_error": "",
       "updated_at": "2026-07-07T15:30:05+09:00"
     }
   }
@@ -170,6 +177,14 @@ can watch gitloop's state without talking to it directly:
   completes without error, so a long-stale value — even while `last_error`
   looks clean — is a sign that syncing has quietly stopped working (e.g.
   expired push credentials).
+- **`repos[path].last_ai_resolve_at`** / **`last_ai_resolve_error`** cover
+  the `on_conflict: claude` path specifically, which `last_error` doesn't:
+  `last_error` only reflects the most recent whole cycle, so an AI
+  resolution that has been silently failing (and falling back to `backup`)
+  for a while can otherwise hide behind unrelated successful cycles.
+  `last_ai_resolve_at` is stamped on the AI path's last success;
+  `last_ai_resolve_error` holds the reason for its most recent failure and
+  is cleared back to `""` the next time it succeeds.
 
 ### Coordinating with another writer
 

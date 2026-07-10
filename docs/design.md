@@ -106,14 +106,17 @@ check markers gone, `git add`
         │
    all files clean?
     │        │
-   yes       no
+   yes       no ──► record last_ai_resolve_error
     │        │
     ▼        ▼
 commit the merge               back up ours/theirs per file,
-(phase stays "idle")           `git checkout --theirs` + `git add` each,
-    │                          commit the merge
-    ▼                          (phase becomes "conflict")
-   push  ◄────────────────────────────┘
+(phase stays "idle",           `git checkout --theirs` + `git add` each,
+ last_ai_resolve_at stamped,   commit the merge
+ message prefixed              (phase becomes "conflict")
+ "[ai-resolved]")
+    │                                   │
+    ▼                                   ▼
+   push  ◄────────────────────────────────┘
 ```
 
 **Why accept theirs instead of ours:** upstream has already been pushed and
@@ -140,6 +143,19 @@ partially attempts a claude resolution. Either path finishes with a plain
 `git commit` (not `git merge --continue` — they're equivalent once
 `MERGE_HEAD` exists and the index is fully staged, but `commit` lets
 gitloop supply its own message).
+
+**AI-resolved commits are marked, not just logged**: a successful claude
+resolution's commit message gets a `[ai-resolved]` prefix (see
+`commitmsg.BuildConflictResolution`), naming the outcome rather than the
+model so the marker doesn't need to change if the resolver behind
+`on_conflict: claude` ever does. This is the only way to tell an
+AI-resolved merge apart from a human/backup one after the fact by reading
+`git log` alone. `tryResolveWithClaude` also reports success/failure to the
+status file (`last_ai_resolve_at` / `last_ai_resolve_error`) independently
+of the cycle-level `last_error`, because a `claude` policy that has quietly
+started failing every cycle (e.g. an expired `ANTHROPIC_API_KEY` under
+launchd) still falls back to `backup` and completes the cycle "successfully"
+— `last_error` alone would never surface that.
 
 ## launchd agent
 
@@ -221,6 +237,13 @@ crash/staleness detection.
   from before: timestamps of the last auto-commit and push, the most recent
   cycle's error (or a `"skipped: ..."` guard/lock reason), and when the
   entry was last written.
+- `last_ai_resolve_at` / `last_ai_resolve_error` — the `on_conflict: claude`
+  path's own success/failure, stamped by `tryResolveWithClaude` independently
+  of `last_error`. `last_ai_resolve_at` advances only when claude actually
+  produces a clean, marker-free resolution; `last_ai_resolve_error` holds the
+  reason for the most recent failed attempt and is cleared on the next
+  success. `gitloop status` surfaces this as a `LAST_AI_RESOLVE` column
+  (the error takes priority over the timestamp when both would apply).
 
 ## Save lock: coordinating with another writer
 
