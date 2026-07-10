@@ -31,8 +31,8 @@ repositories:
 		FetchInterval: 5 * time.Minute,
 		Remote:        "origin",
 		Branch:        "",
-		OnConflict:    OnConflictClaude,
-		SaveLockPath:  filepath.Join(home, "notes", ".notesapp", "state", "save.lock"),
+		OnConflict:    OnConflictBackup,
+		SaveLockPath:  "",
 	}
 	if got := cfg.Repositories[0]; got != want {
 		t.Errorf("Repositories[0] = %+v, want %+v", got, want)
@@ -79,7 +79,7 @@ defaults:
 	}
 }
 
-func TestParseSaveLockPathDefaultsToDotNotesappUnderRepoPath(t *testing.T) {
+func TestParseSaveLockPathDefaultsToDisabled(t *testing.T) {
 	yaml := []byte(`
 repositories:
   - path: ~/notes
@@ -88,10 +88,8 @@ repositories:
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	got := cfg.Repositories[0].SaveLockPath
-	want := filepath.Join(cfg.Repositories[0].Path, ".notesapp", "state", "save.lock")
-	if got != want {
-		t.Errorf("SaveLockPath = %q, want %q", got, want)
+	if got := cfg.Repositories[0].SaveLockPath; got != "" {
+		t.Errorf("SaveLockPath = %q, want \"\" (disabled by default)", got)
 	}
 }
 

@@ -11,17 +11,23 @@ import (
 )
 
 // OnConflict selects how gitloop resolves a real (non-fast-forwardable)
-// rebase conflict.
+// merge conflict.
 type OnConflict string
 
 const (
-	// OnConflictClaude resolves conflicts with `claude -p`, falling back to
-	// OnConflictBackup if the claude CLI or an API key isn't available, or
-	// if it fails to produce a marker-free file.
-	OnConflictClaude OnConflict = "claude"
-	// OnConflictBackup preserves both sides of a conflict as separate files
-	// and aborts the rebase, leaving resolution to the user.
+	// OnConflictBackup is the default: preserve both sides of a conflict as
+	// separate files next to the original, accept the upstream (`theirs`)
+	// side, and complete the merge commit. Nothing is lost — the discarded
+	// local content lives on in the .ours.* backup file. Chosen as default
+	// because it never fails silently when an external dependency (the
+	// claude CLI, ANTHROPIC_API_KEY) is missing or expired.
 	OnConflictBackup OnConflict = "backup"
+	// OnConflictClaude is opt-in: try `claude -p` to resolve the markers,
+	// falling back to OnConflictBackup if the CLI or API key isn't
+	// available, or if the model leaves markers in the file. Requires
+	// explicit configuration since silent AI failure is otherwise hard to
+	// notice.
+	OnConflictClaude OnConflict = "claude"
 )
 
 // Defaults are applied to any Repository field left unset in the config
@@ -49,7 +55,7 @@ var builtinDefaults = Defaults{
 	FetchInterval: 5 * time.Minute,
 	Remote:        "origin",
 	Branch:        "",
-	OnConflict:    OnConflictClaude,
+	OnConflict:    OnConflictBackup,
 }
 
 // Repository is one repository gitloop watches, with all defaults resolved.
@@ -75,9 +81,9 @@ type Repository struct {
 	// SaveLockPath is the advisory lock file gitloop tries to hold (via
 	// flock) before starting each sync cycle, to coordinate with an
 	// external process (e.g. a notes-app server) that may be mid-save on
-	// the same working tree. It defaults to
-	// "<repo path>/.notesapp/state/save.lock"; an empty string disables the
-	// coordination entirely, for repositories with no such external writer.
+	// the same working tree. Empty (the default) disables the coordination
+	// entirely; the external writer's config is responsible for pointing
+	// gitloop at whatever lock file they both agree to hold.
 	SaveLockPath string
 }
 
@@ -231,20 +237,19 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 	return repo, nil
 }
 
-// resolveSaveLockPath applies save_lock_path's three-level precedence: an
-// explicit per-repository value (raw, including an explicit "" to disable)
-// wins; failing that, an explicit defaults-block value (fallback) wins;
-// failing that, the dynamic per-repository default is used. A plain string
-// default can't represent "unset" here because "" is itself a meaningful,
-// explicit value (disable locking), hence the pointer inputs.
-func resolveSaveLockPath(raw, fallback *string, repoPath string) string {
+// resolveSaveLockPath applies save_lock_path's precedence: an explicit
+// per-repository value (raw, including an explicit "" to disable) wins;
+// failing that, an explicit defaults-block value (fallback) wins; failing
+// that, save-lock coordination is off ("" = disabled). Pointer inputs are
+// needed so callers can distinguish "unset" from an explicit empty string.
+func resolveSaveLockPath(raw, fallback *string, _ string) string {
 	if raw != nil {
 		return *raw
 	}
 	if fallback != nil {
 		return *fallback
 	}
-	return filepath.Join(repoPath, ".notesapp", "state", "save.lock")
+	return ""
 }
 
 func parseDurationOr(raw string, fallback time.Duration, field string) (time.Duration, error) {

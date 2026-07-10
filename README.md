@@ -38,23 +38,24 @@ repositories:
   - path: ~/notes
   - path: ~/dev/journal
     settle: 5s
-    on_conflict: backup
+    on_conflict: claude
+    save_lock_path: ~/notes/.myapp/state/save.lock
 defaults:
   settle: 3s          # debounce: commit `settle` after the last file change
   max_wait: 60s        # ...but never wait longer than this while changes keep arriving
   fetch_interval: 5m   # also fetch on a timer, to notice remote-only changes
   remote: origin
   branch: ""           # empty = whatever is currently checked out
-  on_conflict: claude  # "claude" (falls back to "backup") or "backup"
-  save_lock_path: ""   # "" disables save-lock coordination for every repository below
+  on_conflict: backup  # "backup" (default) or "claude" (opt-in, falls back to backup)
+  save_lock_path: ""   # "" (default) disables save-lock coordination
 ```
 
 `~` in `path` is expanded to the user's home directory.
 
-`save_lock_path` defaults to `<path>/.notesapp/state/save.lock` per
-repository — see "Coordinating with another writer" below — and can be
-overridden or set to `""` (disabling it) per repository or for all
-repositories via `defaults`.
+`save_lock_path` is empty (disabled) by default. Set it explicitly — per
+repository or via the `defaults` block — when gitloop shares a working
+tree with another writer that agrees to hold the same lock. See
+"Coordinating with another writer" below.
 
 ## Usage
 
@@ -114,7 +115,15 @@ into `git reflog`'s normal safety net.
 
 If a merge stops on a real conflict, `on_conflict` decides what happens:
 
-- **`claude`** (default): runs `claude -p` on each conflicted file to
+- **`backup`** (default): saves both sides of each conflicted file next to
+  the original, e.g. `notes/todo.conflict.macbook-air.20260707153000.ours.md`
+  and `...theirs.md`, then accepts the upstream (`theirs`) version of each
+  conflicted file and completes the merge commit. Nothing is lost — the
+  discarded local content lives on in the `.ours.` file (and the commit
+  that introduced it stays in `git log`/`git reflog`) — but reconciling it
+  back into the real file is left to you. Chosen as default because it
+  never fails silently: no external dependencies, no API keys to expire.
+- **`claude`** (opt-in): runs `claude -p` on each conflicted file to
   resolve the markers, then checks the file for leftover `<<<<<<<` /
   `=======` / `>>>>>>>` markers before accepting it. Requires **both**
   `ANTHROPIC_API_KEY` to be set and `claude` to be on `PATH`; if either is
@@ -124,14 +133,10 @@ If a merge stops on a real conflict, `on_conflict` decides what happens:
   model, so it stays stable across model changes), e.g.
   `[ai-resolved] [macbook-air] 2026-07-07 15:30 — merged upstream (AI-resolved: notes/todo.md)` —
   so these commits stay identifiable in `git log` later if their content
-  needs a second look.
-- **`backup`**: saves both sides of each conflicted file next to the
-  original, e.g. `notes/todo.conflict.macbook-air.20260707153000.ours.md`
-  and `...theirs.md`, then accepts the upstream (`theirs`) version of each
-  conflicted file and completes the merge commit. Nothing is lost — the
-  discarded local content lives on in the `.ours.` file (and the commit
-  that introduced it stays in `git log`/`git reflog`) — but reconciling it
-  back into the real file is left to you.
+  needs a second look. Because AI resolution can fail silently (expired
+  key, network issue, model regression), `last_ai_resolve_at` /
+  `last_ai_resolve_error` in the status file are the recommended way to
+  watch this path's health when opting in.
 
 Either way, a conflict is logged at `warn`/`error` level, and the
 repository's status is reported as `phase: conflict` (see below) until the
@@ -170,9 +175,10 @@ can watch gitloop's state without talking to it directly:
   gitloop isn't running.
 - **`repos[path].phase`** is `"idle"`, `"syncing"` (a cycle is running,
   fetch through push), or `"conflict"` (conflict backup files are sitting
-  in the working tree, or an external rebase/merge is in progress). A
-  writer sharing the repository should treat `syncing` and `conflict` as
-  "don't touch the working tree right now".
+  in the working tree, or an external rebase/merge is in progress). This
+  is an observation, not a coordination protocol: another writer sharing
+  the working tree should coordinate via `save_lock_path`, not by polling
+  `phase`.
 - **`repos[path].last_successful_sync_at`** only advances when a full cycle
   completes without error, so a long-stale value — even while `last_error`
   looks clean — is a sign that syncing has quietly stopped working (e.g.
@@ -189,17 +195,20 @@ can watch gitloop's state without talking to it directly:
 ### Coordinating with another writer
 
 If some other process also writes directly to a watched repository (not
-through gitloop), both sides need to avoid touching the working tree at the
-same time. gitloop's half of that: before each cycle, it tries a
-non-blocking `flock` on `save_lock_path` (default
-`<repo path>/.notesapp/state/save.lock`); if that fails because the other
+through gitloop), both sides need to avoid touching the working tree at
+the same time. gitloop's half of that: before each cycle, it tries a
+non-blocking `flock` on `save_lock_path`; if that fails because the other
 process is holding it, gitloop retries a few times (waiting `settle`
-between attempts) and then skips the cycle for the next trigger to pick up.
-The other process is expected to hold the same lock (also non-blocking) for
-the duration of its own writes, and to treat `phase: syncing` / `conflict`
-in the status file as "gitloop is mid-write, don't start a write of your
-own". Set `save_lock_path: ""` to disable this for a repository with no
-such external writer.
+between attempts) and then skips the cycle for the next trigger to pick
+up. The other process is expected to hold the same lock (also
+non-blocking) for the duration of its own writes.
+
+`save_lock_path` is empty (disabled) by default. Configure it — per
+repository or via the `defaults` block — with a path both writers agree
+to hold, e.g. `~/notes/.myapp/state/save.lock`. The lock file itself is
+created on demand and can live anywhere both writers can reach; putting
+it inside the repository (in an app-namespaced hidden directory) keeps
+its lifetime tied to the working tree.
 
 ## Logs
 
