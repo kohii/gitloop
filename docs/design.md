@@ -253,9 +253,9 @@ while gitloop handles background sync. Both sides need to avoid touching
 the tree at the same time, so gitloop treats an advisory lock file as a
 handshake:
 
-- `Repository.SaveLockPath` (config key `save_lock_path`) defaults to
-  `<repo path>/.notesapp/state/save.lock`; an empty string disables the
-  whole mechanism for repositories with no such external writer.
+- `Repository.SaveLockPath` (config key `save_lock_path`) is empty by
+  default, which disables the whole mechanism; repositories with such an
+  external writer set it explicitly to a path both sides agree to hold.
 - Each cycle is split by `runRepoLoop` into three phases so the save lock
   is only held for the part that actually touches the working tree:
     1. **Pre-fetch (no lock)**: `PreCheck` + `git fetch`. Fetch is a network

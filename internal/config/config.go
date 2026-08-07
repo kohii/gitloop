@@ -232,7 +232,7 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 		}
 		repo.OnConflict = oc
 	}
-	repo.SaveLockPath = resolveSaveLockPath(raw.SaveLockPath, defaults.SaveLockPath, path)
+	repo.SaveLockPath = resolveSaveLockPath(raw.SaveLockPath, defaults.SaveLockPath)
 
 	return repo, nil
 }
@@ -242,7 +242,7 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 // failing that, an explicit defaults-block value (fallback) wins; failing
 // that, save-lock coordination is off ("" = disabled). Pointer inputs are
 // needed so callers can distinguish "unset" from an explicit empty string.
-func resolveSaveLockPath(raw, fallback *string, _ string) string {
+func resolveSaveLockPath(raw, fallback *string) string {
 	if raw != nil {
 		return *raw
 	}
