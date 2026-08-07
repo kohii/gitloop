@@ -139,8 +139,19 @@ func (r *Runner) ConflictedFiles() ([]string, error) {
 // common ancestor, 2 = ours, 3 = theirs) during a conflict. ok is false, with
 // no error, if that stage does not exist for path (e.g. one side deleted the
 // file) — that is an expected shape of some conflicts, not a failure.
+//
+// The returned content is the smudged (working-tree-equivalent) form of the
+// blob: `git cat-file --filters` runs the path's configured clean/smudge
+// filters before returning bytes. Without this, backing up an "ours" or
+// "theirs" side of a filtered file (e.g. git-crypt, which stores encrypted
+// blobs and decrypts on checkout) would preserve the raw stored blob rather
+// than the plaintext the user wrote — and re-adding that backup would run
+// the clean filter over already-encrypted content, producing an unrecoverable
+// double-encrypted mess. For paths with no filter configured, `--filters`
+// returns the raw blob unchanged, matching the previous `git show :N:<path>`
+// behavior.
 func (r *Runner) ShowStage(stage int, path string) (content string, ok bool, err error) {
-	res, runErr := r.run("show", fmt.Sprintf(":%d:%s", stage, path))
+	res, runErr := r.run("cat-file", "--filters", fmt.Sprintf(":%d:%s", stage, path))
 	if runErr != nil {
 		return "", false, nil
 	}
