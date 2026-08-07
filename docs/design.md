@@ -74,6 +74,22 @@ fetch tick — is deliberate. The commit step is a no-op on a clean working
 tree, so "fetch periodically to notice remote changes" doesn't need a
 separate code path from "the user just saved a file."
 
+**Commit-only repositories stop after the commit step.** `mode:
+commit-only` (`config.ModeCommitOnly`) makes `runRepoLoop` run
+guard -> commit-if-dirty and nothing else: no fetch, no classification
+against the table above, no push. A repository with no remote would
+otherwise fail `git fetch` every cycle — the auto-commit itself would still
+land, since fetch failure is deliberately non-fatal (see "Save lock" below),
+but `last_error` would never clear and `last_successful_sync_at` would never
+advance, leaving the status file's "syncing has quietly stopped working"
+signal stuck on for a repository that was never syncing to begin with.
+
+It's an explicit config value rather than something inferred from an
+unresolvable remote, so a typo'd remote name stays a loud failure instead of
+silently downgrading a synced repository to local-only commits. The periodic
+timer keeps running: with nothing to fetch it becomes the safety net for
+working-tree changes the watcher missed.
+
 ## Conflict flow
 
 `Diverged` maps to `merge, then push`. gitloop never uses `git rebase` or

@@ -13,8 +13,10 @@ const (
 	// PhaseIdle means the repository isn't mid-cycle and has no known
 	// unresolved conflict; it's safe for another process to save into it.
 	PhaseIdle = "idle"
-	// PhaseSyncing means a sync cycle is currently running against the
-	// repository, from the initial fetch through the final push.
+	// PhaseSyncing means a cycle is currently writing to the repository:
+	// the auto-commit through the merge, if any. Fetch and push run outside
+	// this window (see runRepoLoop), so it marks exactly the interval an
+	// external writer needs to stay out of the working tree.
 	PhaseSyncing = "syncing"
 	// PhaseConflict means the repository has conflict backup files that
 	// need a human's attention (see internal/daemon/conflict.go), or a
@@ -30,11 +32,12 @@ type RepoStatus struct {
 	Phase      string `json:"phase"`
 	LastCommit string `json:"last_commit,omitempty"`
 	LastPush   string `json:"last_push,omitempty"`
-	// LastSuccessfulSyncAt is stamped only when a full cycle (fetch through
-	// push) completes without error, so a long-silent value here — as
-	// opposed to LastError, which only reflects the most recent cycle — is
-	// a sign that syncing has been silently broken (e.g. expired push
-	// credentials) for a while.
+	// LastSuccessfulSyncAt is stamped only when a whole cycle completes
+	// without error, so a long-silent value here — as opposed to LastError,
+	// which only reflects the most recent cycle — means this repository has
+	// been failing for a while (e.g. expired push credentials). A cycle
+	// covers fetch through push, or just the auto-commit under
+	// config.ModeCommitOnly.
 	LastSuccessfulSyncAt time.Time `json:"last_successful_sync_at,omitempty"`
 	LastError            string    `json:"last_error,omitempty"`
 	// LastAIResolveAt is stamped when the AI (on_conflict: claude) path last

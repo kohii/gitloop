@@ -78,6 +78,7 @@ func TestRunRepoLoopDebouncesRapidChangesIntoOneCommit(t *testing.T) {
 		Settle:        50 * time.Millisecond,
 		MaxWait:       2 * time.Second,
 		FetchInterval: time.Hour, // effectively disabled for this test
+		Mode:          config.ModeSync,
 		Remote:        "origin",
 		Branch:        "main",
 		OnConflict:    config.OnConflictBackup,
@@ -134,6 +135,7 @@ func TestRunRepoLoopSetsIdlePhaseAfterASuccessfulCycle(t *testing.T) {
 		Settle:        50 * time.Millisecond,
 		MaxWait:       2 * time.Second,
 		FetchInterval: time.Hour,
+		Mode:          config.ModeSync,
 		Remote:        "origin",
 		Branch:        "main",
 		OnConflict:    config.OnConflictBackup,
@@ -180,6 +182,119 @@ func TestRunRepoLoopSetsIdlePhaseAfterASuccessfulCycle(t *testing.T) {
 	}
 }
 
+// noRemoteFakeGit stands in for a repository with no remote at all: every
+// call that would talk to one is recorded and fails the way real git does,
+// so a leaked call shows up twice over — in ops() and, because the error
+// propagates, in the status file's LastError.
+type noRemoteFakeGit struct {
+	*fakeGit
+	opsMu     sync.Mutex
+	remoteOps []string
+}
+
+var errNoRemote = fmt.Errorf("'origin' does not appear to be a git repository")
+
+func (f *noRemoteFakeGit) record(op string) {
+	f.opsMu.Lock()
+	defer f.opsMu.Unlock()
+	f.remoteOps = append(f.remoteOps, op)
+}
+
+func (f *noRemoteFakeGit) ops() []string {
+	f.opsMu.Lock()
+	defer f.opsMu.Unlock()
+	return append([]string(nil), f.remoteOps...)
+}
+
+func (f *noRemoteFakeGit) Fetch(string) error {
+	f.record("fetch")
+	return errNoRemote
+}
+
+func (f *noRemoteFakeGit) RevListLeftRightCount(string, string) (int, int, error) {
+	f.record("rev-list")
+	return 0, 0, errNoRemote
+}
+
+func (f *noRemoteFakeGit) Push(string, string) error {
+	f.record("push")
+	return errNoRemote
+}
+
+// TestRunRepoLoopCommitOnlyModeNeverTouchesARemote pins what commit-only
+// mode is for: a repository with no remote still gets its edits
+// auto-committed, and — unlike the same repository under sync mode, where
+// every cycle fails at `git fetch` — its status stays clean, so a stale
+// last_successful_sync_at keeps meaning "this repository stopped working".
+func TestRunRepoLoopCommitOnlyModeNeverTouchesARemote(t *testing.T) {
+	dir := t.TempDir()
+	// Deliberately outside the watched directory: writing the status file
+	// inside it would re-trigger the watcher and spin the loop on its own
+	// output.
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        20 * time.Millisecond,
+		MaxWait:       2 * time.Second,
+		FetchInterval: time.Hour,
+		Mode:          config.ModeCommitOnly,
+		Remote:        "origin",
+		Branch:        "main",
+		OnConflict:    config.OnConflictBackup,
+	}
+
+	git := &noRemoteFakeGit{fakeGit: &fakeGit{}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+
+	time.Sleep(50 * time.Millisecond)
+	git.fakeGit.markDirty()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	waitFor(t, 2*time.Second, func() bool { return git.fakeGit.commitCount() >= 1 })
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down within 2s of context cancellation")
+	}
+
+	if got := git.ops(); len(got) != 0 {
+		t.Errorf("remote operations = %v, want none in commit-only mode", got)
+	}
+
+	sf, err := LoadStatusFile(statusPath)
+	if err != nil {
+		t.Fatalf("LoadStatusFile: %v", err)
+	}
+	st := sf.Repos[dir]
+	if st.LastError != "" {
+		t.Errorf("LastError = %q, want \"\": a commit-only cycle has nothing that can fail remotely", st.LastError)
+	}
+	if st.LastSuccessfulSyncAt.IsZero() {
+		t.Error("LastSuccessfulSyncAt is zero, want it stamped — a commit-only cycle that commits is a complete cycle")
+	}
+	if st.Phase != PhaseIdle {
+		t.Errorf("Phase = %q, want %q", st.Phase, PhaseIdle)
+	}
+	if st.LastCommit == "" {
+		t.Error("LastCommit is empty, want it stamped after the auto-commit")
+	}
+}
+
 func TestRunRepoLoopSkipsCycleWhileSaveLockIsHeldElsewhere(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, "save.lock")
@@ -191,6 +306,7 @@ func TestRunRepoLoopSkipsCycleWhileSaveLockIsHeldElsewhere(t *testing.T) {
 		Settle:        10 * time.Millisecond,
 		MaxWait:       2 * time.Second,
 		FetchInterval: time.Hour,
+		Mode:          config.ModeSync,
 		Remote:        "origin",
 		Branch:        "main",
 		OnConflict:    config.OnConflictBackup,
@@ -279,6 +395,7 @@ func TestRunRepoLoopDoesNotHoldSaveLockDuringFetch(t *testing.T) {
 		Settle:        20 * time.Millisecond,
 		MaxWait:       2 * time.Second,
 		FetchInterval: time.Hour,
+		Mode:          config.ModeSync,
 		Remote:        "origin",
 		Branch:        "main",
 		OnConflict:    config.OnConflictBackup,
@@ -364,6 +481,7 @@ func TestRunRepoLoopCommitsEvenWhenFetchFailsOffline(t *testing.T) {
 		Settle:        20 * time.Millisecond,
 		MaxWait:       2 * time.Second,
 		FetchInterval: time.Hour,
+		Mode:          config.ModeSync,
 		Remote:        "origin",
 		Branch:        "main",
 		OnConflict:    config.OnConflictBackup,
@@ -442,6 +560,7 @@ func TestRunRepoLoopReleasesSaveLockAfterCommitPhasePanic(t *testing.T) {
 		Settle:        20 * time.Millisecond,
 		MaxWait:       2 * time.Second,
 		FetchInterval: time.Hour,
+		Mode:          config.ModeSync,
 		Remote:        "origin",
 		Branch:        "main",
 		OnConflict:    config.OnConflictBackup,
@@ -545,6 +664,7 @@ func TestRunRepoLoopPhaseIsIdleDuringPush(t *testing.T) {
 		Settle:        20 * time.Millisecond,
 		MaxWait:       2 * time.Second,
 		FetchInterval: time.Hour,
+		Mode:          config.ModeSync,
 		Remote:        "origin",
 		Branch:        "main",
 		OnConflict:    config.OnConflictBackup,

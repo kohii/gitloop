@@ -76,6 +76,11 @@ func statusCmd(args []string, stdout, stderr io.Writer) int {
 				lastAIResolve = st.LastAIResolveAt.Format(time.RFC3339)
 			}
 		}
+		// A commit-only repository never pushes by design. Left as "-" that
+		// reads like a push that hasn't succeeded yet, i.e. a stalled sync.
+		if !repo.SyncsRemote() {
+			lastPush = "n/a"
+		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", repo.Path, phase, lastCommit, lastPush, lastError, lastAIResolve)
 	}
 	return flushOrErr(w, stderr)

@@ -40,10 +40,13 @@ repositories:
     settle: 5s
     on_conflict: claude
     save_lock_path: ~/notes/.myapp/state/save.lock
+  - path: ~/scratch
+    mode: commit-only  # no remote: auto-commit and nothing else
 defaults:
-  settle: 3s          # debounce: commit `settle` after the last file change
+  settle: 3s           # debounce: commit `settle` after the last file change
   max_wait: 60s        # ...but never wait longer than this while changes keep arriving
   fetch_interval: 5m   # also fetch on a timer, to notice remote-only changes
+  mode: sync           # "sync" (default) or "commit-only"
   remote: origin
   branch: ""           # empty = whatever is currently checked out
   on_conflict: backup  # "backup" (default) or "claude" (opt-in, falls back to backup)
@@ -128,6 +131,37 @@ gitloop never runs `git reset --hard` or `git push --force`: every history
 change it makes is an ordinary commit (an auto-commit, a merge commit, or a
 merge commit carrying conflict backups), so nothing is ever discarded except
 into `git reflog`'s normal safety net.
+
+### Commit-only repositories
+
+Not every repository has a remote. Under the default `mode: sync` such a
+repository still gets its edits auto-committed — a failed fetch never skips
+the commit phase — but `git fetch` fails on every single cycle, which leaves
+`last_error` permanently set and `last_successful_sync_at` permanently
+stale. That turns the one signal meant to tell you syncing has broken into
+constant noise.
+
+`mode: commit-only` is the supported way to run gitloop purely as an
+auto-commit daemon:
+
+```yaml
+repositories:
+  - path: ~/journal
+    mode: commit-only
+```
+
+The cycle then stops after step 2 above: no fetch, no merge, no push, and
+`remote` / `branch` are unused. `gitloop status` reports `LAST_PUSH` as
+`n/a` for such a repository, so it can't be mistaken for a sync that has
+stalled. `fetch_interval` still applies: with nothing to fetch it becomes a
+periodic re-check that catches working-tree changes the file watcher missed
+(dropped events, or edits made while the daemon was down).
+
+Commit-only is an explicit opt-in rather than something gitloop infers from
+a remote that doesn't resolve, so a typo'd `remote:` name stays a loud
+failure instead of silently downgrading a synced repository to local-only
+commits. Setting it in the `defaults` block therefore stops *every*
+repository that doesn't say `mode: sync` from syncing.
 
 ## Conflict resolution
 
