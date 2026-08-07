@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -182,6 +183,91 @@ func TestMergeReportsConflict(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("StatusPorcelain after MergeAbort = %#v, want clean", entries)
+	}
+}
+
+// TestShowStageAppliesSmudgeFilter guards against regressing to a plain
+// `git show :N:<path>`, which reads the raw stored blob and bypasses the
+// path's clean/smudge filters. That is a fatal shape for git-crypt users:
+// stage blobs come back encrypted, gitloop's conflict backup writes the
+// ciphertext to disk, and the next `git add -A` runs the clean filter over
+// already-encrypted bytes — producing a double-encrypted file the user can
+// never decrypt.
+//
+// The setup stands in for git-crypt with a ROT13 clean/smudge filter (which
+// is bijective, requires no external tooling, and lets us assert plaintext
+// equality). ShowStage must return the smudged (working-tree-equivalent)
+// bytes for every conflict stage — not the raw ROT13'd blob.
+func TestShowStageAppliesSmudgeFilter(t *testing.T) {
+	requireGit(t)
+	if _, err := exec.LookPath("tr"); err != nil {
+		t.Skip("tr not found in PATH")
+	}
+
+	dir := t.TempDir()
+	r := initRepo(t, dir)
+
+	// The filter must be configured before any file that uses it is
+	// added, so git runs the clean filter on the initial blob too.
+	runIn(t, dir, "config", "filter.rot13.clean", "tr A-Za-z N-ZA-Mn-za-m")
+	runIn(t, dir, "config", "filter.rot13.smudge", "tr A-Za-z N-ZA-Mn-za-m")
+	runIn(t, dir, "config", "filter.rot13.required", "true")
+	// merge=binary matches what git-crypt sets and forces git to treat
+	// the file as binary during a merge — no markers written to the
+	// working tree, both sides recorded in the index. That's the exact
+	// shape ShowStage must survive.
+	writeFile(t, dir, ".gitattributes", "*.secret filter=rot13 merge=binary\n")
+	writeFile(t, dir, "s.secret", "base plaintext\n")
+	if err := r.AddAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Commit("base"); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, dir, "branch", "upstream")
+
+	writeFile(t, dir, "s.secret", "ours plaintext\n")
+	if err := r.AddAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Commit("ours"); err != nil {
+		t.Fatal(err)
+	}
+
+	runIn(t, dir, "checkout", "-q", "upstream")
+	writeFile(t, dir, "s.secret", "theirs plaintext\n")
+	runIn(t, dir, "add", "-A")
+	runIn(t, dir, "commit", "-q", "-m", "theirs")
+	runIn(t, dir, "checkout", "-q", "main")
+
+	conflict, err := r.Merge("upstream")
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if !conflict {
+		t.Fatal("Merge() conflict = false, want true for the binary-merge case")
+	}
+
+	// Sanity: git left the file marker-less because merge=binary.
+	got, err := os.ReadFile(filepath.Join(dir, "s.secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "<<<<<<<") {
+		t.Fatalf("working tree unexpectedly has conflict markers under merge=binary: %q", got)
+	}
+
+	if content, ok, err := r.ShowStage(2, "s.secret"); err != nil || !ok || content != "ours plaintext\n" {
+		t.Errorf("ShowStage(2, s.secret) = %q, ok=%v err=%v, want smudged \"ours plaintext\\n\", ok",
+			content, ok, err)
+	}
+	if content, ok, err := r.ShowStage(3, "s.secret"); err != nil || !ok || content != "theirs plaintext\n" {
+		t.Errorf("ShowStage(3, s.secret) = %q, ok=%v err=%v, want smudged \"theirs plaintext\\n\", ok",
+			content, ok, err)
+	}
+
+	if err := r.MergeAbort(); err != nil {
+		t.Fatalf("MergeAbort: %v", err)
 	}
 }
 

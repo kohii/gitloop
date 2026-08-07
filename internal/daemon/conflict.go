@@ -98,12 +98,37 @@ var runClaudeOnFile = func(repoPath, file string) error {
 
 func tryResolveWithClaude(git GitClient, repoPath string, files []string, logger *slog.Logger, recorder *statusRecorder) bool {
 	for _, f := range files {
+		full := filepath.Join(repoPath, f)
+
+		// Only text conflicts — the ones where git wrote <<<<<<< / =======
+		// / >>>>>>> markers into the working tree — are safe to hand to
+		// claude. Marker-less conflicts (binary merges via merge=binary,
+		// git-crypt files, auto-detected binaries, modify/delete conflicts)
+		// leave the working tree with just one side's content. There is
+		// nothing there for claude to reconcile, and if we then `git add`
+		// the file, git silently collapses the higher index stages to
+		// whatever the working tree holds — dropping the other side without
+		// warning. Refusing claude for these and returning false takes us
+		// through the backup path, which preserves both sides via
+		// ShowStage.
+		has, readOK := readConflictMarkers(full)
+		if !readOK {
+			logger.Warn("conflicted file could not be read; skipping claude and falling back to backup", "file", f)
+			recordAIResolveFailure(recorder, repoPath, fmt.Sprintf("conflicted file %s could not be read", f), logger)
+			return false
+		}
+		if !has {
+			logger.Warn("conflicted file has no conflict markers (binary, modify/delete, or opaque merge); skipping claude and falling back to backup", "file", f)
+			recordAIResolveFailure(recorder, repoPath, fmt.Sprintf("marker-less conflict in %s cannot be safely resolved by claude", f), logger)
+			return false
+		}
+
 		if err := runClaudeOnFile(repoPath, f); err != nil {
 			logger.Warn("claude failed while resolving a conflict", "file", f, "error", err)
 			recordAIResolveFailure(recorder, repoPath, fmt.Sprintf("claude failed on %s: %v", f, err), logger)
 			return false
 		}
-		if hasConflictMarkers(filepath.Join(repoPath, f)) {
+		if stillHas, _ := readConflictMarkers(full); stillHas {
 			logger.Warn("claude left conflict markers in place", "file", f)
 			recordAIResolveFailure(recorder, repoPath, fmt.Sprintf("claude left conflict markers in %s", f), logger)
 			return false
@@ -130,14 +155,21 @@ func recordAIResolveFailure(recorder *statusRecorder, repoPath, reason string, l
 	}
 }
 
-func hasConflictMarkers(path string) bool {
+// readConflictMarkers reports whether path contains git conflict markers
+// (<<<<<<< / ======= / >>>>>>>). readOK is false only when the file cannot
+// be opened, so callers can distinguish "no markers present" from "we don't
+// know" — the two cases need opposite treatment when deciding whether to run
+// claude vs. whether to accept a claude-produced resolution.
+func readConflictMarkers(path string) (hasMarkers, readOK bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		// Can't verify the file is clean; treat it as unresolved.
-		return true
+		return false, false
 	}
 	s := string(data)
-	return strings.Contains(s, "<<<<<<<") || strings.Contains(s, "=======") || strings.Contains(s, ">>>>>>>")
+	has := strings.Contains(s, "<<<<<<<") ||
+		strings.Contains(s, "=======") ||
+		strings.Contains(s, ">>>>>>>")
+	return has, true
 }
 
 // backupAndAcceptTheirs preserves both sides of each conflicted file next to
