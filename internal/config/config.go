@@ -308,6 +308,13 @@ func parseDurationOr(raw string, fallback time.Duration, field string) (time.Dur
 	if err != nil {
 		return 0, fmt.Errorf("%s: invalid duration %q: %w", field, raw, err)
 	}
+	// Every duration in this config drives a timer or ticker, and
+	// time.NewTicker panics on a non-positive interval. Rejecting it here
+	// makes it a startup error the user sees immediately, instead of a
+	// recovered panic that leaves one repository permanently unwatched.
+	if d <= 0 {
+		return 0, fmt.Errorf("%s: must be positive, got %q", field, raw)
+	}
 	return d, nil
 }
 

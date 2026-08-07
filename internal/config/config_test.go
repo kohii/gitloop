@@ -191,6 +191,23 @@ func TestSyncsRemote(t *testing.T) {
 	}
 }
 
+// TestParseRejectsNonPositiveDurations guards the timers these values feed:
+// time.NewTicker panics on a non-positive interval, which the daemon would
+// recover into an endlessly retried failure with that repository never
+// actually watched. A startup error is the visible failure instead.
+func TestParseRejectsNonPositiveDurations(t *testing.T) {
+	for _, field := range []string{"settle", "max_wait", "fetch_interval"} {
+		for _, value := range []string{"0s", "-1s"} {
+			t.Run(field+"="+value, func(t *testing.T) {
+				yaml := []byte("repositories:\n  - path: ~/notes\n    " + field + ": " + value + "\n")
+				if _, err := Parse(yaml); err == nil {
+					t.Fatalf("Parse with %s: %s: want error, got nil", field, value)
+				}
+			})
+		}
+	}
+}
+
 func TestParseRequiresAtLeastOneRepository(t *testing.T) {
 	if _, err := Parse([]byte(`repositories: []`)); err == nil {
 		t.Fatal("Parse with no repositories: want error, got nil")
