@@ -17,8 +17,9 @@ import (
 )
 
 // runRepoLoop watches repo.Path for file changes and drives the settle /
-// max-wait debounced sync cycle, plus a periodic fetch-driven cycle, until
-// ctx is canceled.
+// max-wait debounced sync cycle, plus a periodic timer-driven cycle, until
+// ctx is canceled. Under config.ModeCommitOnly the cycle stops after the
+// auto-commit phase.
 //
 // It returns nil only on a graceful ctx cancellation. Any other return is a
 // setup or watcher failure that the caller should treat as retryable.
@@ -33,10 +34,20 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		return fmt.Errorf("watching %s: %w", repo.Path, err)
 	}
 
+	// A commit-only repository has no remote to talk to, so its cycle stops
+	// after the auto-commit phase.
+	syncsRemote := repo.SyncsRemote()
+	if !syncsRemote {
+		logger.Info("commit-only mode: this repository will not fetch, merge, or push")
+	}
+
 	var settleTimer, maxWaitTimer *time.Timer
 	defer stopTimer(settleTimer)
 	defer stopTimer(maxWaitTimer)
 
+	// With nothing to fetch, this timer still earns its keep as a safety net
+	// for working-tree changes the watcher missed (dropped fsnotify events,
+	// edits made while the daemon was down).
 	fetchTicker := time.NewTicker(repo.FetchInterval)
 	defer fetchTicker.Stop()
 
@@ -60,9 +71,13 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		// LastError; integrate + push are skipped because we no longer have
 		// fresh upstream data to classify against.
 		var fetchErr error
-		if err := git.Fetch(repo.Remote); err != nil {
-			fetchErr = fmt.Errorf("fetch: %w", err)
-			logger.Warn("fetch failed; running commit-only cycle", "error", fetchErr)
+		if syncsRemote {
+			if err := git.Fetch(repo.Remote); err != nil {
+				fetchErr = fmt.Errorf("fetch: %w", err)
+				// Not called a "commit-only cycle": that names a configured
+				// mode, and this is a transient failure in a repo that syncs.
+				logger.Warn("fetch failed; committing local changes only this cycle", "error", fetchErr)
+			}
 		}
 
 		// From here on the cycle touches the working tree (auto-commit,
@@ -94,7 +109,7 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		result = runCommitPhase(git, hostname, logger)
 		var branch string
 		var needPush bool
-		if result.Err == nil && fetchErr == nil {
+		if syncsRemote && result.Err == nil && fetchErr == nil {
 			integrateResult, b, n := runIntegratePhase(git, repo, hostname, logger, recorder)
 			// Preserve Committed from the commit phase — runIntegratePhase
 			// returns a fresh cycleResult that doesn't know about it.

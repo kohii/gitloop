@@ -29,6 +29,7 @@ repositories:
 		Settle:        3 * time.Second,
 		MaxWait:       60 * time.Second,
 		FetchInterval: 5 * time.Minute,
+		Mode:          ModeSync,
 		Remote:        "origin",
 		Branch:        "",
 		OnConflict:    OnConflictBackup,
@@ -136,6 +137,74 @@ defaults:
 	}
 	if got := cfg.Repositories[0].SaveLockPath; got != "" {
 		t.Errorf("SaveLockPath = %q, want \"\" (disabled via defaults block)", got)
+	}
+}
+
+func TestParseModePerRepoAndFromDefaultsBlock(t *testing.T) {
+	yaml := []byte(`
+repositories:
+  - path: ~/notes
+  - path: ~/journal
+    mode: sync
+defaults:
+  mode: commit-only
+`)
+	cfg, err := Parse(yaml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Repositories[0].Mode; got != ModeCommitOnly {
+		t.Errorf("Repositories[0].Mode = %q, want %q (from defaults block)", got, ModeCommitOnly)
+	}
+	if got := cfg.Repositories[1].Mode; got != ModeSync {
+		t.Errorf("Repositories[1].Mode = %q, want %q (per-repo override wins)", got, ModeSync)
+	}
+}
+
+func TestParseRejectsUnknownMode(t *testing.T) {
+	cases := map[string]string{
+		"per repo": "repositories:\n  - path: ~/notes\n    mode: offline\n",
+		"defaults": "repositories:\n  - path: ~/notes\ndefaults:\n  mode: offline\n",
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(yaml)); err == nil {
+				t.Fatal("Parse with unknown mode: want error, got nil")
+			}
+		})
+	}
+}
+
+func TestSyncsRemote(t *testing.T) {
+	cases := map[Mode]bool{
+		ModeSync:       true,
+		ModeCommitOnly: false,
+		// A hand-built Repository that never set Mode still syncs, so a
+		// forgotten field can't silently turn someone's sync into local
+		// commits.
+		Mode(""): true,
+	}
+	for mode, want := range cases {
+		if got := (Repository{Mode: mode}).SyncsRemote(); got != want {
+			t.Errorf("Repository{Mode: %q}.SyncsRemote() = %v, want %v", mode, got, want)
+		}
+	}
+}
+
+// TestParseRejectsNonPositiveDurations guards the timers these values feed:
+// time.NewTicker panics on a non-positive interval, which the daemon would
+// recover into an endlessly retried failure with that repository never
+// actually watched. A startup error is the visible failure instead.
+func TestParseRejectsNonPositiveDurations(t *testing.T) {
+	for _, field := range []string{"settle", "max_wait", "fetch_interval"} {
+		for _, value := range []string{"0s", "-1s"} {
+			t.Run(field+"="+value, func(t *testing.T) {
+				yaml := []byte("repositories:\n  - path: ~/notes\n    " + field + ": " + value + "\n")
+				if _, err := Parse(yaml); err == nil {
+					t.Fatalf("Parse with %s: %s: want error, got nil", field, value)
+				}
+			})
+		}
 	}
 }
 

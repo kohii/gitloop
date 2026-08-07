@@ -10,6 +10,21 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Mode selects how much of the sync cycle a repository runs.
+type Mode string
+
+const (
+	// ModeSync is the default: auto-commit, then fetch, integrate, and push
+	// against the configured remote.
+	ModeSync Mode = "sync"
+	// ModeCommitOnly stops the cycle after the auto-commit phase — no fetch,
+	// no merge, no push. It's for repositories with no remote at all, which
+	// under ModeSync would fail `git fetch` every cycle and so never report
+	// a healthy status. See docs/design.md for why it's an explicit opt-in
+	// rather than inferred from an unresolvable remote.
+	ModeCommitOnly Mode = "commit-only"
+)
+
 // OnConflict selects how gitloop resolves a real (non-fast-forwardable)
 // merge conflict.
 type OnConflict string
@@ -36,6 +51,7 @@ type Defaults struct {
 	Settle        time.Duration
 	MaxWait       time.Duration
 	FetchInterval time.Duration
+	Mode          Mode
 	Remote        string
 	Branch        string
 	OnConflict    OnConflict
@@ -53,6 +69,7 @@ var builtinDefaults = Defaults{
 	Settle:        3 * time.Second,
 	MaxWait:       60 * time.Second,
 	FetchInterval: 5 * time.Minute,
+	Mode:          ModeSync,
 	Remote:        "origin",
 	Branch:        "",
 	OnConflict:    OnConflictBackup,
@@ -68,9 +85,14 @@ type Repository struct {
 	// MaxWait is the longest gitloop will delay a commit while changes keep
 	// arriving before settle is reached.
 	MaxWait time.Duration
-	// FetchInterval is how often gitloop fetches the remote even without
-	// local file activity, to pick up changes made elsewhere.
+	// FetchInterval is how often gitloop runs a cycle even without local
+	// file activity: under ModeSync that fetch is what picks up changes made
+	// elsewhere, and under ModeCommitOnly it is the safety net that catches
+	// working-tree changes the file watcher missed.
 	FetchInterval time.Duration
+	// Mode selects whether the cycle talks to a remote at all. Under
+	// ModeCommitOnly, Remote and Branch are unused.
+	Mode Mode
 	// Remote is the git remote name to fetch from and push to.
 	Remote string
 	// Branch is the branch to sync. Empty means "whatever is currently
@@ -85,6 +107,15 @@ type Repository struct {
 	// entirely; the external writer's config is responsible for pointing
 	// gitloop at whatever lock file they both agree to hold.
 	SaveLockPath string
+}
+
+// SyncsRemote reports whether this repository fetches, integrates, and
+// pushes after the auto-commit phase. Every mode but ModeCommitOnly does,
+// including the zero value — Parse always fills Mode in, so an empty Mode
+// means a hand-built Repository, and a forgotten field shouldn't silently
+// disable someone's sync.
+func (r Repository) SyncsRemote() bool {
+	return r.Mode != ModeCommitOnly
 }
 
 // Config is gitloop's fully resolved configuration: every repository has all
@@ -107,6 +138,7 @@ type rawRepository struct {
 	Settle        string  `yaml:"settle"`
 	MaxWait       string  `yaml:"max_wait"`
 	FetchInterval string  `yaml:"fetch_interval"`
+	Mode          string  `yaml:"mode"`
 	Remote        string  `yaml:"remote"`
 	Branch        string  `yaml:"branch"`
 	OnConflict    string  `yaml:"on_conflict"`
@@ -117,6 +149,7 @@ type rawDefaults struct {
 	Settle        string  `yaml:"settle"`
 	MaxWait       string  `yaml:"max_wait"`
 	FetchInterval string  `yaml:"fetch_interval"`
+	Mode          string  `yaml:"mode"`
 	Remote        string  `yaml:"remote"`
 	Branch        string  `yaml:"branch"`
 	OnConflict    string  `yaml:"on_conflict"`
@@ -174,6 +207,13 @@ func resolveDefaults(raw rawDefaults) (Defaults, error) {
 	if d.FetchInterval, err = parseDurationOr(raw.FetchInterval, d.FetchInterval, "fetch_interval"); err != nil {
 		return Defaults{}, err
 	}
+	if raw.Mode != "" {
+		m, err := parseMode(raw.Mode)
+		if err != nil {
+			return Defaults{}, err
+		}
+		d.Mode = m
+	}
 	if raw.Remote != "" {
 		d.Remote = raw.Remote
 	}
@@ -205,6 +245,7 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 		Settle:        defaults.Settle,
 		MaxWait:       defaults.MaxWait,
 		FetchInterval: defaults.FetchInterval,
+		Mode:          defaults.Mode,
 		Remote:        defaults.Remote,
 		Branch:        defaults.Branch,
 		OnConflict:    defaults.OnConflict,
@@ -219,6 +260,13 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 	if repo.FetchInterval, err = parseDurationOr(raw.FetchInterval, repo.FetchInterval, "fetch_interval"); err != nil {
 		return Repository{}, err
 	}
+	if raw.Mode != "" {
+		m, err := parseMode(raw.Mode)
+		if err != nil {
+			return Repository{}, err
+		}
+		repo.Mode = m
+	}
 	if raw.Remote != "" {
 		repo.Remote = raw.Remote
 	}
@@ -232,7 +280,7 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 		}
 		repo.OnConflict = oc
 	}
-	repo.SaveLockPath = resolveSaveLockPath(raw.SaveLockPath, defaults.SaveLockPath, path)
+	repo.SaveLockPath = resolveSaveLockPath(raw.SaveLockPath, defaults.SaveLockPath)
 
 	return repo, nil
 }
@@ -242,7 +290,7 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 // failing that, an explicit defaults-block value (fallback) wins; failing
 // that, save-lock coordination is off ("" = disabled). Pointer inputs are
 // needed so callers can distinguish "unset" from an explicit empty string.
-func resolveSaveLockPath(raw, fallback *string, _ string) string {
+func resolveSaveLockPath(raw, fallback *string) string {
 	if raw != nil {
 		return *raw
 	}
@@ -260,7 +308,23 @@ func parseDurationOr(raw string, fallback time.Duration, field string) (time.Dur
 	if err != nil {
 		return 0, fmt.Errorf("%s: invalid duration %q: %w", field, raw, err)
 	}
+	// Every duration in this config drives a timer or ticker, and
+	// time.NewTicker panics on a non-positive interval. Rejecting it here
+	// makes it a startup error the user sees immediately, instead of a
+	// recovered panic that leaves one repository permanently unwatched.
+	if d <= 0 {
+		return 0, fmt.Errorf("%s: must be positive, got %q", field, raw)
+	}
 	return d, nil
+}
+
+func parseMode(raw string) (Mode, error) {
+	switch Mode(raw) {
+	case ModeSync, ModeCommitOnly:
+		return Mode(raw), nil
+	default:
+		return "", fmt.Errorf("mode: unknown value %q (want %q or %q)", raw, ModeSync, ModeCommitOnly)
+	}
 }
 
 func parseOnConflict(raw string) (OnConflict, error) {
