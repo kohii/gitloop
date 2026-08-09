@@ -28,7 +28,7 @@ repositories:
 		Path:          filepath.Join(home, "notes"),
 		Settle:        3 * time.Second,
 		MaxWait:       60 * time.Second,
-		FetchInterval: 5 * time.Minute,
+		FetchInterval: 30 * time.Second,
 		Mode:          ModeSync,
 		Workflow:      WorkflowAutoCommitSync,
 		Remote:        "origin",

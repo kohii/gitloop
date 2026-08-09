@@ -84,7 +84,7 @@ type Defaults struct {
 var builtinDefaults = Defaults{
 	Settle:        3 * time.Second,
 	MaxWait:       60 * time.Second,
-	FetchInterval: 5 * time.Minute,
+	FetchInterval: 30 * time.Second,
 	Mode:          ModeSync,
 	Remote:        "origin",
 	Branch:        "",
