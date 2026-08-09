@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -50,5 +53,45 @@ func TestBootoutArgs(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("bootoutArgs[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestRegisterLaunchAgentReplacesExistingRegistration(t *testing.T) {
+	var calls [][]string
+	run := func(args []string, stdout, stderr io.Writer) error {
+		calls = append(calls, append([]string(nil), args...))
+		return nil
+	}
+
+	if err := registerLaunchAgentWith(run, "/tmp/gitloop.plist", &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("registerLaunchAgentWith: %v", err)
+	}
+
+	want := [][]string{bootoutArgs(), bootstrapArgs("/tmp/gitloop.plist")}
+	if len(calls) != len(want) {
+		t.Fatalf("launchctl calls = %v, want %v", calls, want)
+	}
+	for i := range want {
+		if fmt.Sprint(calls[i]) != fmt.Sprint(want[i]) {
+			t.Errorf("launchctl call %d = %v, want %v", i, calls[i], want[i])
+		}
+	}
+}
+
+func TestRegisterLaunchAgentIgnoresMissingExistingRegistration(t *testing.T) {
+	var calls [][]string
+	run := func(args []string, stdout, stderr io.Writer) error {
+		calls = append(calls, append([]string(nil), args...))
+		if len(calls) == 1 {
+			return errors.New("service not found")
+		}
+		return nil
+	}
+
+	if err := registerLaunchAgentWith(run, "/tmp/gitloop.plist", &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("registerLaunchAgentWith: %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("launchctl call count = %d, want 2", len(calls))
 	}
 }

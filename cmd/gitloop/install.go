@@ -64,15 +64,35 @@ func installCmd(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "gitloop install: wrote %s\n", plistPath)
 
-	cmd := exec.Command("launchctl", bootstrapArgs(plistPath)...)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
+	if err := registerLaunchAgent(plistPath, stdout, stderr); err != nil {
 		fmt.Fprintf(stderr, "gitloop install: launchctl bootstrap failed: %v\n", err)
 		return 1
 	}
 	fmt.Fprintf(stdout, "gitloop install: registered %s with launchd (logs: %s)\n", launchAgentLabel, logPath)
 	return 0
+}
+
+type launchctlRunner func(args []string, stdout, stderr io.Writer) error
+
+// registerLaunchAgent replaces any existing registration before bootstrapping
+// the current plist. launchctl bootstrap is not idempotent by itself: it
+// fails when the label is already registered.
+func registerLaunchAgent(plistPath string, stdout, stderr io.Writer) error {
+	return registerLaunchAgentWith(runLaunchctl, plistPath, stdout, stderr)
+}
+
+func registerLaunchAgentWith(run launchctlRunner, plistPath string, stdout, stderr io.Writer) error {
+	// The service may not exist on the first install, so an unsuccessful
+	// bootout is expected and must not make install fail.
+	_ = run(bootoutArgs(), io.Discard, io.Discard)
+	return run(bootstrapArgs(plistPath), stdout, stderr)
+}
+
+func runLaunchctl(args []string, stdout, stderr io.Writer) error {
+	cmd := exec.Command("launchctl", args...)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd.Run()
 }
 
 func uninstallCmd(args []string, stdout, stderr io.Writer) int {
