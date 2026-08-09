@@ -48,6 +48,24 @@ see "Package boundaries" below.
   `gitcmd.Runner`) rather than `gitcmd` directly, so tests drive the loop
   against an in-memory fake instead of a real checkout.
 
+### Workflow contracts
+
+The legacy `mode` values remain supported, but new configurations may use a
+nested `workflow` tag. The three workflow contracts are:
+
+- `auto-commit-sync` — the existing auto-commit, fetch, integrate, and push
+  behavior.
+- `auto-commit-only` — the existing local auto-commit behavior.
+- `committed-sync` — transport commits that already exist, without ever
+  staging or creating a commit.
+
+`committed-sync` fetches on every cycle, pushes an ahead branch even when the
+working tree is dirty, fast-forwards only a clean working tree, and refuses
+diverged histories. It never creates a merge commit: a human must resolve a
+divergence before gitloop can transport the resulting commits. The dirty check
+is repeated immediately before a fast-forward while the save lock is held, so
+a save arriving during classification cannot be overwritten.
+
 ## Sync state table
 
 After `git fetch`, `git rev-list --left-right --count <branch>...<remote>/<branch>`
@@ -68,7 +86,7 @@ middle of operating on. gitloop itself never leaves a rebase in progress
 (it doesn't use `git rebase` at all), so a rebase marker found here always
 means an external tool or a person started one by hand.
 
-Reusing the same cycle (guard -> commit-if-dirty -> fetch -> classify -> act)
+Reusing the same cycle (guard -> fetch -> commit-if-dirty -> classify -> act)
 for all three triggers — settle timer, max-wait timer, and the periodic
 fetch tick — is deliberate. The commit step is a no-op on a clean working
 tree, so "fetch periodically to notice remote changes" doesn't need a
@@ -89,6 +107,14 @@ unresolvable remote, so a typo'd remote name stays a loud failure instead of
 silently downgrading a synced repository to local-only commits. The periodic
 timer keeps running: with nothing to fetch it becomes the safety net for
 working-tree changes the watcher missed.
+
+**Committed-sync repositories stop before the commit step.** They still fetch
+and classify the local branch, but only take these actions: no-op for Equal,
+push for Ahead, fast-forward for clean Behind, and a reported blocked state
+for dirty Behind or Diverged. This mode is intentionally stricter than a
+generic `auto_commit: false` flag: it prevents a future integration policy
+from silently creating merge commits under a workflow whose contract is that
+commits are human-created.
 
 ## Conflict flow
 
@@ -237,7 +263,7 @@ crash/staleness detection.
 **Per-repository fields** (`repos[<path>]`):
 
 - `phase` — `"idle"`, `"syncing"`, or `"conflict"`. `runRepoLoop` sets
-  `syncing` immediately before a cycle starts (fetch through push) and
+  `syncing` immediately before the local write/integration phase and
   resolves it to `idle` or `conflict` when the cycle ends — `conflict` if
   the cycle just committed a backup-and-accept-theirs merge (see "Conflict
   flow"), or if `PreCheck` found a rebase/merge already in progress;
@@ -253,6 +279,10 @@ crash/staleness detection.
   from before: timestamps of the last auto-commit and push, the most recent
   cycle's error (or a `"skipped: ..."` guard/lock reason), and when the
   entry was last written.
+- `blocked_reason` — a concise reason a committed-sync cycle deliberately
+  stopped, such as `dirty-working-tree`, `diverged-history`, or
+  `operation-in-progress`. It is cleared by the next cycle that completes
+  without a block.
 - `last_ai_resolve_at` / `last_ai_resolve_error` — the `on_conflict: claude`
   path's own success/failure, stamped by `tryResolveWithClaude` independently
   of `last_error`. `last_ai_resolve_at` advances only when claude actually
@@ -291,6 +321,8 @@ handshake:
        via `defer` in addition to being called explicitly at the end of
        the phase, so a panic inside a merge or conflict-resolution step
        can't leak the flock and deadlock every subsequent cycle.
+       In `committed-sync`, this phase only checks status and performs a
+       clean-tree fast-forward; it never stages, commits, or merges.
     3. **Push (lock released)**: push if the state was Ahead or Diverged.
        Like fetch, this is network I/O that doesn't touch the working
        tree; holding the lock across a slow push would just delay the

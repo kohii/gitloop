@@ -24,8 +24,19 @@ type cycleResult struct {
 	// via the backup policy, leaving unresolved-by-a-human conflict backup
 	// files in the working tree that still need attention.
 	Conflict bool
-	Err      error
+	// BlockedReason is a stable status-facing reason for a deliberate
+	// committed-sync refusal, such as a dirty working tree behind upstream or
+	// divergent histories. It is intentionally separate from Err so callers
+	// can display a concise actionable status while retaining the full error.
+	BlockedReason string
+	Err           error
 }
+
+const (
+	BlockedDirtyBehind = "dirty-working-tree"
+	BlockedDiverged    = "diverged-history"
+	BlockedOperation   = "operation-in-progress"
+)
 
 // runPreCheckPhase runs the guard step that opens a sync cycle: is there a
 // rebase or merge already in progress that gitloop should stay out of? It
@@ -70,14 +81,11 @@ func runCommitPhase(git GitClient, hostname string, logger *slog.Logger) (result
 // repo.Branch has already been resolved to the currently-checked-out
 // branch). The caller is expected to hold the save lock across this phase.
 func runIntegratePhase(git GitClient, repo config.Repository, hostname string, logger *slog.Logger, recorder *statusRecorder) (result cycleResult, branch string, needPush bool) {
-	branch = repo.Branch
-	if branch == "" {
-		b, err := git.CurrentBranch()
-		if err != nil {
-			result.Err = fmt.Errorf("current branch: %w", err)
-			return
-		}
-		branch = b
+	var err error
+	branch, err = checkedOutBranch(git, repo.Branch)
+	if err != nil {
+		result.Err = err
+		return
 	}
 	upstream := repo.Remote + "/" + branch
 
@@ -122,6 +130,96 @@ func runIntegratePhase(git GitClient, repo config.Repository, hostname string, l
 		needPush = true
 	}
 	return
+}
+
+// runCommittedSyncPhase transports only commits that already exist. It never
+// stages or creates a commit, never merges divergent histories, and only
+// fast-forwards a clean working tree. A push is safe with a dirty working
+// tree because it changes the remote ref, not the checkout.
+//
+// The caller holds the configured save lock. The dirty check is repeated
+// immediately before a fast-forward so a cooperating writer cannot save
+// between classification and integration. With save-lock coordination
+// disabled, git's own clean-tree checks remain the final guard, but external
+// writers have no advisory-lock handshake with the daemon.
+func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.Logger) (result cycleResult, branch string, needPush bool) {
+	var err error
+	branch, err = checkedOutBranch(git, repo.Branch)
+	if err != nil {
+		result.Err = err
+		return
+	}
+	upstream := repo.Remote + "/" + branch
+
+	entries, err := git.StatusPorcelain()
+	if err != nil {
+		result.Err = fmt.Errorf("status: %w", err)
+		return
+	}
+	dirty := len(entries) > 0
+
+	ahead, behind, err := git.RevListLeftRightCount(branch, upstream)
+	if err != nil {
+		result.Err = fmt.Errorf("rev-list: %w", err)
+		return
+	}
+	state := statemachine.Classify(ahead, behind)
+	result.Action = statemachine.ActionFor(state)
+	logger.Info("classified committed-sync state", "state", state.String(), "ahead", ahead, "behind", behind, "dirty", dirty)
+
+	switch state {
+	case statemachine.Equal:
+		// A dirty tree is fine when no remote commit needs to be checked out.
+
+	case statemachine.Ahead:
+		needPush = true
+
+	case statemachine.Behind:
+		if dirty {
+			result.BlockedReason = BlockedDirtyBehind
+			result.Err = fmt.Errorf("working tree is dirty; postponing fast-forward")
+			return
+		}
+		// Re-check after classification and immediately before changing the
+		// checkout. This is the last safe point before git mutates files.
+		entries, err = git.StatusPorcelain()
+		if err != nil {
+			result.Err = fmt.Errorf("status before fast-forward: %w", err)
+			return
+		}
+		if len(entries) > 0 {
+			result.BlockedReason = BlockedDirtyBehind
+			result.Err = fmt.Errorf("working tree became dirty; postponing fast-forward")
+			return
+		}
+		if err := git.MergeFF(upstream); err != nil {
+			result.Err = fmt.Errorf("fast-forward merge: %w", err)
+			return
+		}
+
+	case statemachine.Diverged:
+		result.BlockedReason = BlockedDiverged
+		result.Err = fmt.Errorf("local and upstream histories diverged; manual merge required")
+	}
+	return
+}
+
+// checkedOutBranch resolves the branch to operate on and refuses to use a
+// configured branch that is not currently checked out. Git's merge and
+// fast-forward commands always update the checked-out branch, so classifying
+// one branch and then updating another would be silently destructive.
+func checkedOutBranch(git GitClient, configured string) (string, error) {
+	current, err := git.CurrentBranch()
+	if err != nil {
+		return "", fmt.Errorf("current branch: %w", err)
+	}
+	if configured != "" && configured != current {
+		return "", fmt.Errorf("configured branch %q is not checked out (currently on %q)", configured, current)
+	}
+	if configured != "" {
+		return configured, nil
+	}
+	return current, nil
 }
 
 // commitIfDirty stages and commits any pending working-tree changes. It

@@ -30,6 +30,7 @@ repositories:
 		MaxWait:       60 * time.Second,
 		FetchInterval: 5 * time.Minute,
 		Mode:          ModeSync,
+		Workflow:      WorkflowAutoCommitSync,
 		Remote:        "origin",
 		Branch:        "",
 		OnConflict:    OnConflictBackup,
@@ -109,6 +110,65 @@ repositories:
 	}
 }
 
+func TestParseSaveLockPathExpandsHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	yaml := []byte(`
+repositories:
+  - path: ~/notes
+    save_lock_path: ~/.config/gitloop/save.lock
+`)
+	cfg, err := Parse(yaml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := filepath.Join(home, ".config", "gitloop", "save.lock")
+	if got := cfg.Repositories[0].SaveLockPath; got != want {
+		t.Errorf("SaveLockPath = %q, want %q", got, want)
+	}
+}
+
+func TestParseWorkflowSaveLockPathExpandsHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	yaml := []byte(`
+repositories:
+  - path: ~/dotfiles
+    workflow:
+      type: committed-sync
+      save_lock_path: ~/.config/gitloop/save.lock
+`)
+	cfg, err := Parse(yaml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := filepath.Join(home, ".config", "gitloop", "save.lock")
+	if got := cfg.Repositories[0].SaveLockPath; got != want {
+		t.Errorf("SaveLockPath = %q, want %q", got, want)
+	}
+}
+
+func TestParseWorkflowEmptySaveLockPathDisablesIt(t *testing.T) {
+	yaml := []byte(`
+repositories:
+  - path: ~/dotfiles
+    workflow:
+      type: committed-sync
+      save_lock_path: ""
+`)
+	cfg, err := Parse(yaml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Repositories[0].SaveLockPath; got != "" {
+		t.Errorf("SaveLockPath = %q, want empty string (disabled)", got)
+	}
+}
+
 func TestParseSaveLockPathEmptyStringDisablesIt(t *testing.T) {
 	yaml := []byte(`
 repositories:
@@ -175,10 +235,100 @@ func TestParseRejectsUnknownMode(t *testing.T) {
 	}
 }
 
+func TestParseCommittedSyncWorkflow(t *testing.T) {
+	yaml := []byte(`
+repositories:
+  - path: ~/dotfiles
+    workflow:
+      type: committed-sync
+      remote: origin
+      branch: main
+      interval: 1m
+`)
+	cfg, err := Parse(yaml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	repo := cfg.Repositories[0]
+	if repo.Workflow != WorkflowCommittedSync || repo.Mode != ModeCommittedSync {
+		t.Fatalf("workflow = (%q, mode %q), want committed-sync", repo.Workflow, repo.Mode)
+	}
+	if repo.Remote != "origin" || repo.Branch != "main" || repo.FetchInterval != time.Minute {
+		t.Errorf("repository overrides = %+v, want origin/main/1m", repo)
+	}
+	if repo.AutoCommits() {
+		t.Error("committed-sync AutoCommits() = true, want false")
+	}
+	if !repo.SyncsRemote() {
+		t.Error("committed-sync SyncsRemote() = false, want true")
+	}
+}
+
+func TestParseWorkflowRejectsInvalidCombinations(t *testing.T) {
+	cases := map[string]string{
+		"unknown type": `repositories:
+  - path: ~/dotfiles
+    workflow:
+      type: no-such-workflow
+`,
+		"mode conflict": `repositories:
+  - path: ~/dotfiles
+    mode: sync
+    workflow:
+      type: committed-sync
+`,
+		"committed auto-commit setting": `repositories:
+  - path: ~/dotfiles
+    settle: 1s
+    workflow:
+      type: committed-sync
+`,
+		"auto-commit-only remote": `repositories:
+  - path: ~/journal
+    workflow:
+      type: auto-commit-only
+      remote: origin
+`,
+		"duplicate conflict policy": `repositories:
+  - path: ~/notes
+    on_conflict: claude
+    workflow:
+      type: auto-commit-sync
+      on_conflict: backup
+`,
+		"legacy committed-sync auto-commit setting": `repositories:
+  - path: ~/dotfiles
+    mode: committed-sync
+    max_wait: 1m
+`,
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(yaml)); err == nil {
+				t.Fatal("Parse: want error, got nil")
+			}
+		})
+	}
+}
+
+func TestParseRejectsUnknownWorkflowField(t *testing.T) {
+	yaml := []byte(`
+repositories:
+  - path: ~/dotfiles
+    workflow:
+      type: committed-sync
+      intervl: 1m
+`)
+	if _, err := Parse(yaml); err == nil {
+		t.Fatal("Parse with unknown workflow field: want error, got nil")
+	}
+}
+
 func TestSyncsRemote(t *testing.T) {
 	cases := map[Mode]bool{
-		ModeSync:       true,
-		ModeCommitOnly: false,
+		ModeSync:          true,
+		ModeCommitOnly:    false,
+		ModeCommittedSync: true,
 		// A hand-built Repository that never set Mode still syncs, so a
 		// forgotten field can't silently turn someone's sync into local
 		// commits.

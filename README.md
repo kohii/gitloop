@@ -53,6 +53,26 @@ defaults:
   save_lock_path: ""   # "" (default) disables save-lock coordination
 ```
 
+For repositories where commits must always be made by a person, use an
+explicit workflow. `committed-sync` never stages or creates a commit:
+
+```yaml
+repositories:
+  - path: ~/dotfiles
+    workflow:
+      type: committed-sync
+      remote: origin
+      branch: main
+      interval: 1m
+```
+
+The other workflow types correspond to the legacy `mode` values:
+`auto-commit-sync` is the default `sync` behavior and `auto-commit-only` is
+the default `commit-only` behavior. `mode: committed-sync` is also accepted
+as a legacy alias. A nested `workflow` cannot be combined with `mode`.
+Workflow-specific fields that do not apply to the selected type are rejected
+at startup.
+
 `~` in `path` is expanded to the user's home directory.
 
 `save_lock_path` is empty (disabled) by default. Set it explicitly — per
@@ -98,10 +118,13 @@ runs regardless of how many repositories are configured.
 table:
 
 ```
-PATH                PHASE  LAST_COMMIT                LAST_PUSH                  LAST_ERROR      LAST_AI_RESOLVE
-/Users/you/notes    idle   2026-07-07T07:07:47+09:00  2026-07-07T07:07:47+09:00  -               -
-/Users/you/journal  -      -                          -                          not yet synced  -
+PATH                PHASE  LAST_COMMIT                LAST_PUSH                  LAST_ERROR      BLOCKED             LAST_AI_RESOLVE
+/Users/you/notes    idle   2026-07-07T07:07:47+09:00  2026-07-07T07:07:47+09:00  -               -                    -
+/Users/you/journal  -      -                          -                          not yet synced  -                    -
 ```
+
+The `BLOCKED` column reports why a committed-sync repository is waiting,
+such as `dirty-working-tree` or `diverged-history`.
 
 ## Sync behavior
 
@@ -112,10 +135,12 @@ runs one cycle per repository:
    (detected by checking `.git/rebase-merge`, `.git/rebase-apply`,
    `.git/MERGE_HEAD`), so gitloop never interferes with something a human
    (or another tool) is in the middle of.
-2. **Auto-commit** — if the working tree is dirty, `git add -A` and commit
+2. **Fetch** — retrieve the configured remote so the local branch can be
+   classified against current upstream data.
+3. **Auto-commit** — if the working tree is dirty, `git add -A` and commit
    with a generated message: `[<hostname>] <date> <time> — <change summary>`,
    e.g. `[macbook-air] 2026-07-07 15:30 — updated: notes/todo.md, added: notes/2026-07-07.md`.
-3. **Fetch**, then classify the local branch against its upstream:
+4. **Classify and integrate**, then push when required:
 
    | ahead | behind | action              |
    |------:|-------:|---------------------|
@@ -162,6 +187,32 @@ a remote that doesn't resolve, so a typo'd `remote:` name stays a loud
 failure instead of silently downgrading a synced repository to local-only
 commits. Setting it in the `defaults` block therefore stops *every*
 repository that doesn't say `mode: sync` from syncing.
+
+### Committed-sync repositories
+
+`workflow.type: committed-sync` is for repositories such as a shared dotfiles
+checkout where people make commits explicitly, while gitloop transports those
+commits between machines. It never runs `git add`, `git commit`, `git stash`,
+`git reset`, or an automatic merge.
+
+Each cycle fetches the remote and classifies the checked-out branch:
+
+| working tree | state | action |
+|--------------|-------|--------|
+| clean or dirty | equal | nothing |
+| clean or dirty | ahead | push existing commits |
+| clean | behind | fast-forward |
+| dirty | behind | defer and report `dirty-working-tree` |
+| clean or dirty | diverged | defer and report `diverged-history` |
+
+Fetching and pushing existing commits are safe while files are being edited.
+Updating the checked-out branch is deliberately limited to a clean working
+tree, and divergent histories are left for a human to merge or rebase. The
+periodic `interval` is important because a manual commit changes `.git`, which
+does not produce a watched working-tree event. If another process writes the
+checkout concurrently, configure `save_lock_path` and have that process hold
+the same advisory lock; without it, Git's own clean-tree checks are the final
+guard but there is no coordination handshake.
 
 ## Conflict resolution
 
@@ -230,8 +281,8 @@ can watch gitloop's state without talking to it directly:
   process apart from one that's merely idle: if `last_heartbeat_at` is
   stale (older than a few heartbeat intervals) or `pid` no longer exists,
   gitloop isn't running.
-- **`repos[path].phase`** is `"idle"`, `"syncing"` (a cycle is running,
-  fetch through push), or `"conflict"` (conflict backup files are sitting
+- **`repos[path].phase`** is `"idle"`, `"syncing"` (the repository is in its
+  local write/integration phase), or `"conflict"` (conflict backup files are sitting
   in the working tree, or an external rebase/merge is in progress). This
   is an observation, not a coordination protocol: another writer sharing
   the working tree should coordinate via `save_lock_path`, not by polling

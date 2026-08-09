@@ -96,3 +96,34 @@ func TestStatusCmdShowsLastAIResolveOutcome(t *testing.T) {
 		t.Errorf("stdout missing LastAIResolveError for the failing repo:\n%s", out)
 	}
 }
+
+func TestStatusCmdShowsBlockedReason(t *testing.T) {
+	dir := t.TempDir()
+	repoPath := filepath.Join(dir, "dotfiles")
+	configPath := filepath.Join(dir, "config.yaml")
+	yaml := "repositories:\n  - path: " + repoPath + "\n    workflow:\n      type: committed-sync\n"
+	if err := os.WriteFile(configPath, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	statusPath := filepath.Join(dir, "status.json")
+	sf := &daemon.StatusFile{Repos: map[string]daemon.RepoStatus{
+		repoPath: {Path: repoPath, BlockedReason: "dirty-working-tree"},
+	}}
+	if err := sf.Save(statusPath); err != nil {
+		t.Fatal(err)
+	}
+
+	origStatusPathFunc := statusPathFunc
+	statusPathFunc = func() (string, error) { return statusPath, nil }
+	defer func() { statusPathFunc = origStatusPathFunc }()
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"status", "--config", configPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "dirty-working-tree") {
+		t.Errorf("stdout missing blocked reason:\n%s", stdout.String())
+	}
+}

@@ -74,10 +74,23 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		if syncsRemote {
 			if err := git.Fetch(repo.Remote); err != nil {
 				fetchErr = fmt.Errorf("fetch: %w", err)
-				// Not called a "commit-only cycle": that names a configured
-				// mode, and this is a transient failure in a repo that syncs.
-				logger.Warn("fetch failed; committing local changes only this cycle", "error", fetchErr)
+				if repo.AutoCommits() {
+					// Not called a "commit-only cycle": that names a configured
+					// mode, and this is a transient failure in a repo that syncs.
+					logger.Warn("fetch failed; committing local changes only this cycle", "error", fetchErr)
+				} else {
+					logger.Warn("fetch failed; committed-sync cycle deferred", "error", fetchErr)
+				}
 			}
+		}
+
+		// A committed-sync cycle has no local write phase when fetch fails:
+		// there is no auto-commit to preserve, and integration against stale
+		// upstream data would be unsafe. Surface the error immediately.
+		if repo.IsCommittedSync() && fetchErr != nil {
+			result.Err = fetchErr
+			applyCycleResult(recorder, repo.Path, result, logger)
+			return
 		}
 
 		// From here on the cycle touches the working tree (auto-commit,
@@ -87,6 +100,7 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			logger.Warn("skipped: save in-flight")
 			if err := recorder.update(repo.Path, func(s *RepoStatus) {
 				s.LastError = "skipped: save in-flight"
+				s.BlockedReason = BlockedOperation
 			}); err != nil {
 				logger.Error("writing status file failed", "error", err)
 			}
@@ -106,10 +120,14 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			logger.Error("writing status file failed", "error", err)
 		}
 
-		result = runCommitPhase(git, hostname, logger)
 		var branch string
 		var needPush bool
-		if syncsRemote && result.Err == nil && fetchErr == nil {
+		if repo.AutoCommits() {
+			result = runCommitPhase(git, hostname, logger)
+		} else {
+			result, branch, needPush = runCommittedSyncPhase(git, repo, logger)
+		}
+		if repo.AutoCommits() && syncsRemote && result.Err == nil && fetchErr == nil {
 			integrateResult, b, n := runIntegratePhase(git, repo, hostname, logger, recorder)
 			// Preserve Committed from the commit phase — runIntegratePhase
 			// returns a fresh cycleResult that doesn't know about it.
@@ -147,6 +165,13 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		}
 
 		applyCycleResult(recorder, repo.Path, result, logger)
+	}
+
+	if repo.IsCommittedSync() {
+		// Manual commits change .git rather than the watched working tree, so
+		// there may be no fsnotify event after the user commits. Run once at
+		// startup to avoid waiting for the first interval tick.
+		runCycle("startup")
 	}
 
 	for {
@@ -232,12 +257,15 @@ func applyCycleResult(recorder *statusRecorder, repoPath string, result cycleRes
 			// up conflict) needs attention before it's safe to save into
 			// the repository again.
 			s.LastError = "skipped: " + result.Skipped
+			s.BlockedReason = BlockedOperation
 			s.Phase = PhaseConflict
 		case result.Err != nil:
 			s.LastError = result.Err.Error()
+			s.BlockedReason = result.BlockedReason
 			s.Phase = PhaseIdle
 		default:
 			s.LastError = ""
+			s.BlockedReason = ""
 			s.LastSuccessfulSyncAt = now
 			if result.Conflict {
 				s.Phase = PhaseConflict

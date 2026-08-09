@@ -14,9 +14,9 @@ const (
 	// unresolved conflict; it's safe for another process to save into it.
 	PhaseIdle = "idle"
 	// PhaseSyncing means a cycle is currently writing to the repository:
-	// the auto-commit through the merge, if any. Fetch and push run outside
-	// this window (see runRepoLoop), so it marks exactly the interval an
-	// external writer needs to stay out of the working tree.
+	// auto-commit, fast-forward, or merge, depending on the workflow. Fetch
+	// and push run outside this window (see runRepoLoop), so it marks exactly
+	// the interval an external writer needs to stay out of the working tree.
 	PhaseSyncing = "syncing"
 	// PhaseConflict means the repository has conflict backup files that
 	// need a human's attention (see internal/daemon/conflict.go), or a
@@ -37,9 +37,13 @@ type RepoStatus struct {
 	// which only reflects the most recent cycle — means this repository has
 	// been failing for a while (e.g. expired push credentials). A cycle
 	// covers fetch through push, or just the auto-commit under
-	// config.ModeCommitOnly.
+	// config.ModeCommitOnly, or fetch/classification/fast-forward under
+	// config.ModeCommittedSync.
 	LastSuccessfulSyncAt time.Time `json:"last_successful_sync_at,omitempty"`
 	LastError            string    `json:"last_error,omitempty"`
+	// BlockedReason explains why a committed-sync repository could not safely
+	// advance its checked-out branch. It is empty for ordinary successes.
+	BlockedReason string `json:"blocked_reason,omitempty"`
 	// LastAIResolveAt is stamped when the AI (on_conflict: claude) path last
 	// resolved a conflict successfully. Unlike LastError, which reflects only
 	// the most recent whole cycle, this lets a long silence in AI resolution

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +24,21 @@ const (
 	// a healthy status. See docs/design.md for why it's an explicit opt-in
 	// rather than inferred from an unresolvable remote.
 	ModeCommitOnly Mode = "commit-only"
+	// ModeCommittedSync only transports commits that already exist in the
+	// repository. It never stages or creates a commit, fast-forwards only when
+	// the working tree is clean, and refuses to merge divergent histories.
+	ModeCommittedSync Mode = "committed-sync"
+)
+
+// WorkflowType is the explicit workflow contract for a repository. The
+// legacy mode field remains supported, but new configurations can use a
+// tagged workflow so that invalid combinations are rejected at parse time.
+type WorkflowType string
+
+const (
+	WorkflowAutoCommitSync WorkflowType = "auto-commit-sync"
+	WorkflowAutoCommitOnly WorkflowType = "auto-commit-only"
+	WorkflowCommittedSync  WorkflowType = "committed-sync"
 )
 
 // OnConflict selects how gitloop resolves a real (non-fast-forwardable)
@@ -86,13 +102,17 @@ type Repository struct {
 	// arriving before settle is reached.
 	MaxWait time.Duration
 	// FetchInterval is how often gitloop runs a cycle even without local
-	// file activity: under ModeSync that fetch is what picks up changes made
-	// elsewhere, and under ModeCommitOnly it is the safety net that catches
-	// working-tree changes the file watcher missed.
+	// file activity: under a remote workflow it fetches changes made elsewhere,
+	// and under an auto-commit-only workflow it catches working-tree changes the
+	// file watcher missed.
 	FetchInterval time.Duration
-	// Mode selects whether the cycle talks to a remote at all. Under
-	// ModeCommitOnly, Remote and Branch are unused.
+	// Mode is the legacy workflow selector. Under ModeCommitOnly, Remote and
+	// Branch are unused; ModeCommittedSync uses them without auto-committing.
 	Mode Mode
+	// Workflow is the explicit workflow contract. It is populated for parsed
+	// configurations and may be left empty on hand-built repositories, in
+	// which case Mode determines the behavior for backwards compatibility.
+	Workflow WorkflowType
 	// Remote is the git remote name to fetch from and push to.
 	Remote string
 	// Branch is the branch to sync. Empty means "whatever is currently
@@ -110,12 +130,39 @@ type Repository struct {
 }
 
 // SyncsRemote reports whether this repository fetches, integrates, and
-// pushes after the auto-commit phase. Every mode but ModeCommitOnly does,
+// pushes after its local phase. Every mode but ModeCommitOnly does,
 // including the zero value — Parse always fills Mode in, so an empty Mode
 // means a hand-built Repository, and a forgotten field shouldn't silently
 // disable someone's sync.
 func (r Repository) SyncsRemote() bool {
-	return r.Mode != ModeCommitOnly
+	return r.effectiveWorkflow() != WorkflowAutoCommitOnly
+}
+
+// AutoCommits reports whether a cycle may stage and create a commit from the
+// working tree. Committed-sync repositories leave all working-tree and index
+// changes under the user's control.
+func (r Repository) AutoCommits() bool {
+	return r.effectiveWorkflow() != WorkflowCommittedSync
+}
+
+// IsCommittedSync reports whether this repository transports only commits
+// that were created by a human or another external process.
+func (r Repository) IsCommittedSync() bool {
+	return r.effectiveWorkflow() == WorkflowCommittedSync
+}
+
+func (r Repository) effectiveWorkflow() WorkflowType {
+	if r.Workflow != "" {
+		return r.Workflow
+	}
+	switch r.Mode {
+	case ModeCommitOnly:
+		return WorkflowAutoCommitOnly
+	case ModeCommittedSync:
+		return WorkflowCommittedSync
+	default:
+		return WorkflowAutoCommitSync
+	}
 }
 
 // Config is gitloop's fully resolved configuration: every repository has all
@@ -134,15 +181,27 @@ type rawConfig struct {
 }
 
 type rawRepository struct {
-	Path          string  `yaml:"path"`
-	Settle        string  `yaml:"settle"`
-	MaxWait       string  `yaml:"max_wait"`
-	FetchInterval string  `yaml:"fetch_interval"`
-	Mode          string  `yaml:"mode"`
-	Remote        string  `yaml:"remote"`
-	Branch        string  `yaml:"branch"`
-	OnConflict    string  `yaml:"on_conflict"`
-	SaveLockPath  *string `yaml:"save_lock_path"`
+	Path          string       `yaml:"path"`
+	Settle        string       `yaml:"settle"`
+	MaxWait       string       `yaml:"max_wait"`
+	FetchInterval string       `yaml:"fetch_interval"`
+	Mode          string       `yaml:"mode"`
+	Remote        string       `yaml:"remote"`
+	Branch        string       `yaml:"branch"`
+	OnConflict    string       `yaml:"on_conflict"`
+	SaveLockPath  *string      `yaml:"save_lock_path"`
+	Workflow      *rawWorkflow `yaml:"workflow"`
+}
+
+type rawWorkflow struct {
+	Type         string  `yaml:"type"`
+	Remote       string  `yaml:"remote"`
+	Branch       string  `yaml:"branch"`
+	Interval     string  `yaml:"interval"`
+	Settle       string  `yaml:"settle"`
+	MaxWait      string  `yaml:"max_wait"`
+	OnConflict   string  `yaml:"on_conflict"`
+	SaveLockPath *string `yaml:"save_lock_path"`
 }
 
 type rawDefaults struct {
@@ -170,7 +229,9 @@ func Load(path string) (*Config, error) {
 // disk.
 func Parse(data []byte) (*Config, error) {
 	var raw rawConfig
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("config: parsing YAML: %w", err)
 	}
 	if len(raw.Repositories) == 0 {
@@ -246,6 +307,7 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 		MaxWait:       defaults.MaxWait,
 		FetchInterval: defaults.FetchInterval,
 		Mode:          defaults.Mode,
+		Workflow:      workflowForMode(defaults.Mode),
 		Remote:        defaults.Remote,
 		Branch:        defaults.Branch,
 		OnConflict:    defaults.OnConflict,
@@ -266,6 +328,7 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 			return Repository{}, err
 		}
 		repo.Mode = m
+		repo.Workflow = workflowForMode(m)
 	}
 	if raw.Remote != "" {
 		repo.Remote = raw.Remote
@@ -280,8 +343,147 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 		}
 		repo.OnConflict = oc
 	}
-	repo.SaveLockPath = resolveSaveLockPath(raw.SaveLockPath, defaults.SaveLockPath)
+	repo.SaveLockPath, err = resolveSaveLockPath(raw.SaveLockPath, defaults.SaveLockPath)
+	if err != nil {
+		return Repository{}, err
+	}
+	if repo.IsCommittedSync() && raw.Workflow == nil {
+		if err := validateCommittedSyncLegacyFields(raw); err != nil {
+			return Repository{}, err
+		}
+	}
 
+	if raw.Workflow != nil {
+		if raw.Mode != "" {
+			return Repository{}, fmt.Errorf("workflow cannot be combined with mode")
+		}
+		workflow, err := parseWorkflow(raw.Workflow.Type)
+		if err != nil {
+			return Repository{}, err
+		}
+		var workflowErr error
+		repo, workflowErr = applyWorkflow(repo, raw, raw.Workflow, workflow)
+		if workflowErr != nil {
+			return Repository{}, workflowErr
+		}
+		repo.Workflow = workflow
+		switch workflow {
+		case WorkflowAutoCommitSync:
+			repo.Mode = ModeSync
+		case WorkflowAutoCommitOnly:
+			repo.Mode = ModeCommitOnly
+		case WorkflowCommittedSync:
+			repo.Mode = ModeCommittedSync
+		}
+	}
+
+	return repo, nil
+}
+
+func workflowForMode(mode Mode) WorkflowType {
+	switch mode {
+	case ModeCommitOnly:
+		return WorkflowAutoCommitOnly
+	case ModeCommittedSync:
+		return WorkflowCommittedSync
+	default:
+		return WorkflowAutoCommitSync
+	}
+}
+
+func parseWorkflow(raw string) (WorkflowType, error) {
+	w := WorkflowType(raw)
+	switch w {
+	case WorkflowAutoCommitSync, WorkflowAutoCommitOnly, WorkflowCommittedSync:
+		return w, nil
+	default:
+		return "", fmt.Errorf("workflow.type: unknown value %q (want %q, %q, or %q)", raw, WorkflowAutoCommitSync, WorkflowAutoCommitOnly, WorkflowCommittedSync)
+	}
+}
+
+func validateCommittedSyncLegacyFields(raw rawRepository) error {
+	if raw.Settle != "" || raw.MaxWait != "" || raw.OnConflict != "" {
+		return fmt.Errorf("mode %q does not accept settle, max_wait, or on_conflict", ModeCommittedSync)
+	}
+	return nil
+}
+
+// applyWorkflow applies the nested workflow overrides and rejects fields that
+// would be meaningless for the selected workflow. The flat legacy fields are
+// still accepted for shared defaults, but a repository-level duplicate is
+// rejected when the nested form also specifies the same value.
+func applyWorkflow(repo Repository, raw rawRepository, wf *rawWorkflow, workflow WorkflowType) (Repository, error) {
+	if workflow == WorkflowAutoCommitOnly {
+		if wf.Remote != "" || wf.Branch != "" || wf.OnConflict != "" || raw.Remote != "" || raw.Branch != "" || raw.OnConflict != "" {
+			return Repository{}, fmt.Errorf("workflow.type %q does not accept remote, branch, or on_conflict", workflow)
+		}
+	}
+	if workflow == WorkflowCommittedSync && (raw.Settle != "" || raw.MaxWait != "" || raw.OnConflict != "" || wf.Settle != "" || wf.MaxWait != "" || wf.OnConflict != "") {
+		return Repository{}, fmt.Errorf("workflow.type %q does not accept settle, max_wait, or on_conflict", workflow)
+	}
+
+	if wf.Remote != "" {
+		if raw.Remote != "" {
+			return Repository{}, fmt.Errorf("workflow.remote cannot be combined with remote")
+		}
+		repo.Remote = wf.Remote
+	}
+	if wf.Branch != "" {
+		if raw.Branch != "" {
+			return Repository{}, fmt.Errorf("workflow.branch cannot be combined with branch")
+		}
+		repo.Branch = wf.Branch
+	}
+	if wf.Interval != "" {
+		if raw.FetchInterval != "" {
+			return Repository{}, fmt.Errorf("workflow.interval cannot be combined with fetch_interval")
+		}
+		d, err := parseDurationOr(wf.Interval, repo.FetchInterval, "workflow.interval")
+		if err != nil {
+			return Repository{}, err
+		}
+		repo.FetchInterval = d
+	}
+	if wf.Settle != "" {
+		if raw.Settle != "" {
+			return Repository{}, fmt.Errorf("workflow.settle cannot be combined with settle")
+		}
+		d, err := parseDurationOr(wf.Settle, repo.Settle, "workflow.settle")
+		if err != nil {
+			return Repository{}, err
+		}
+		repo.Settle = d
+	}
+	if wf.MaxWait != "" {
+		if raw.MaxWait != "" {
+			return Repository{}, fmt.Errorf("workflow.max_wait cannot be combined with max_wait")
+		}
+		d, err := parseDurationOr(wf.MaxWait, repo.MaxWait, "workflow.max_wait")
+		if err != nil {
+			return Repository{}, err
+		}
+		repo.MaxWait = d
+	}
+	if wf.OnConflict != "" {
+		if raw.OnConflict != "" {
+			return Repository{}, fmt.Errorf("workflow.on_conflict cannot be combined with on_conflict")
+		}
+		oc, err := parseOnConflict(wf.OnConflict)
+		if err != nil {
+			return Repository{}, err
+		}
+		repo.OnConflict = oc
+	}
+	if wf.SaveLockPath != nil {
+		if raw.SaveLockPath != nil {
+			return Repository{}, fmt.Errorf("workflow.save_lock_path cannot be combined with save_lock_path")
+		}
+		expanded, err := resolveSaveLockPath(wf.SaveLockPath, nil)
+		if err != nil {
+			return Repository{}, fmt.Errorf("workflow.save_lock_path: %w", err)
+		}
+		repo.SaveLockPath = expanded
+	}
 	return repo, nil
 }
 
@@ -290,14 +492,17 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 // failing that, an explicit defaults-block value (fallback) wins; failing
 // that, save-lock coordination is off ("" = disabled). Pointer inputs are
 // needed so callers can distinguish "unset" from an explicit empty string.
-func resolveSaveLockPath(raw, fallback *string) string {
+func resolveSaveLockPath(raw, fallback *string) (string, error) {
+	var path string
 	if raw != nil {
-		return *raw
+		path = *raw
+	} else if fallback != nil {
+		path = *fallback
 	}
-	if fallback != nil {
-		return *fallback
+	if path == "" {
+		return "", nil
 	}
-	return ""
+	return expandHome(path)
 }
 
 func parseDurationOr(raw string, fallback time.Duration, field string) (time.Duration, error) {
@@ -320,10 +525,10 @@ func parseDurationOr(raw string, fallback time.Duration, field string) (time.Dur
 
 func parseMode(raw string) (Mode, error) {
 	switch Mode(raw) {
-	case ModeSync, ModeCommitOnly:
+	case ModeSync, ModeCommitOnly, ModeCommittedSync:
 		return Mode(raw), nil
 	default:
-		return "", fmt.Errorf("mode: unknown value %q (want %q or %q)", raw, ModeSync, ModeCommitOnly)
+		return "", fmt.Errorf("mode: unknown value %q (want %q, %q, or %q)", raw, ModeSync, ModeCommitOnly, ModeCommittedSync)
 	}
 }
 
