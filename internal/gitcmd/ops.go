@@ -33,6 +33,17 @@ func (r *Runner) Fetch(remote string) error {
 	return err
 }
 
+// RemoteNames returns the names of all remotes configured for the repository.
+// `git remote` exits successfully and prints nothing when the repository has
+// no remotes.
+func (r *Runner) RemoteNames() ([]string, error) {
+	res, err := r.run("remote")
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(res.Stdout), nil
+}
+
 // CurrentBranch returns the checked-out branch name.
 func (r *Runner) CurrentBranch() (string, error) {
 	res, err := r.run("rev-parse", "--abbrev-ref", "HEAD")

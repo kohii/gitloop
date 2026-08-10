@@ -10,6 +10,7 @@ type GitClient interface {
 	AddAll() error
 	AddPath(path string) error
 	Commit(message string) error
+	RemoteNames() ([]string, error)
 	Fetch(remote string) error
 	CurrentBranch() (string, error)
 	RevListLeftRightCount(local, upstream string) (ahead, behind int, err error)

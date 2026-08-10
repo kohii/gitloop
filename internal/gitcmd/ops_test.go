@@ -62,6 +62,29 @@ func TestAddAllAndCommit(t *testing.T) {
 	}
 }
 
+func TestRemoteNames(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	r := initRepo(t, dir)
+
+	remotes, err := r.RemoteNames()
+	if err != nil {
+		t.Fatalf("RemoteNames without remotes: %v", err)
+	}
+	if len(remotes) != 0 {
+		t.Fatalf("RemoteNames without remotes = %v, want empty", remotes)
+	}
+
+	runIn(t, dir, "remote", "add", "origin", "https://example.com/repo.git")
+	remotes, err = r.RemoteNames()
+	if err != nil {
+		t.Fatalf("RemoteNames with origin: %v", err)
+	}
+	if got := strings.Join(remotes, ","); got != "origin" {
+		t.Errorf("RemoteNames with origin = %q, want origin", got)
+	}
+}
+
 func TestFetchAndRevListLeftRightCount(t *testing.T) {
 	requireGit(t)
 

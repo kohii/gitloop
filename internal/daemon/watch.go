@@ -34,6 +34,8 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		return fmt.Errorf("watching %s: %w", repo.Path, err)
 	}
 
+	repo = resolveRepositoryMode(git, repo, logger)
+
 	// A commit-only repository has no remote to talk to, so its cycle stops
 	// after the auto-commit phase.
 	syncsRemote := repo.SyncsRemote()
@@ -238,6 +240,30 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			runCycle("fetch-interval")
 		}
 	}
+}
+
+// resolveRepositoryMode turns the legacy omitted mode into commit-only when
+// the Git repository has no remotes. An explicit mode or workflow always wins:
+// in particular, mode: sync remains a loud choice when its configured remote
+// is missing or misspelled. A failure to inspect remotes is also not treated
+// as proof that there are none, so the existing sync-mode error remains visible.
+func resolveRepositoryMode(git GitClient, repo config.Repository, logger *slog.Logger) config.Repository {
+	if repo.Mode == config.ModeCommitOnly || repo.ModeWasExplicitlySet() ||
+		repo.WorkflowWasExplicitlySet() || repo.IsCommittedSync() {
+		return repo
+	}
+
+	remotes, err := git.RemoteNames()
+	if err != nil {
+		logger.Warn("failed to inspect git remotes; keeping sync mode", "error", err)
+		return repo
+	}
+	if len(remotes) == 0 {
+		repo.Mode = config.ModeCommitOnly
+		repo.Workflow = config.WorkflowAutoCommitOnly
+		logger.Info("no git remotes configured; using commit-only mode")
+	}
+	return repo
 }
 
 func applyCycleResult(recorder *statusRecorder, repoPath string, result cycleResult, logger *slog.Logger) {

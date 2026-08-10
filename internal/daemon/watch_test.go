@@ -57,6 +57,7 @@ func (f *fakeGit) Commit(string) error {
 	return nil
 }
 
+func (f *fakeGit) RemoteNames() ([]string, error)                         { return []string{"origin"}, nil }
 func (f *fakeGit) Fetch(string) error                                     { return nil }
 func (f *fakeGit) CurrentBranch() (string, error)                         { return "main", nil }
 func (f *fakeGit) RevListLeftRightCount(string, string) (int, int, error) { return 0, 0, nil }
@@ -211,6 +212,10 @@ func (f *noRemoteFakeGit) Fetch(string) error {
 	return errNoRemote
 }
 
+func (f *noRemoteFakeGit) RemoteNames() ([]string, error) {
+	return nil, nil
+}
+
 func (f *noRemoteFakeGit) RevListLeftRightCount(string, string) (int, int, error) {
 	f.record("rev-list")
 	return 0, 0, errNoRemote
@@ -292,6 +297,157 @@ func TestRunRepoLoopCommitOnlyModeNeverTouchesARemote(t *testing.T) {
 	}
 	if st.LastCommit == "" {
 		t.Error("LastCommit is empty, want it stamped after the auto-commit")
+	}
+}
+
+func TestRunRepoLoopAutoSelectsCommitOnlyWhenModeIsOmittedAndNoRemote(t *testing.T) {
+	dir := t.TempDir()
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+
+	cfg, err := config.Parse([]byte("repositories:\n  - path: " + dir + "\n"))
+	if err != nil {
+		t.Fatalf("config.Parse: %v", err)
+	}
+	repo := cfg.Repositories[0]
+	repo.Settle = 20 * time.Millisecond
+	repo.MaxWait = 2 * time.Second
+	repo.FetchInterval = time.Hour
+	if repo.ModeWasExplicitlySet() {
+		t.Fatal("minimal config unexpectedly marked mode as explicit")
+	}
+
+	git := &noRemoteFakeGit{fakeGit: &fakeGit{}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+
+	time.Sleep(50 * time.Millisecond)
+	git.fakeGit.markDirty()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return git.fakeGit.commitCount() >= 1 })
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down within 2s of context cancellation")
+	}
+
+	if got := git.ops(); len(got) != 0 {
+		t.Errorf("remote operations = %v, want none when omitted mode detects no remotes", got)
+	}
+	sf, err := LoadStatusFile(statusPath)
+	if err != nil {
+		t.Fatalf("LoadStatusFile: %v", err)
+	}
+	if got := sf.Repos[dir].LastError; got != "" {
+		t.Errorf("LastError = %q, want empty after automatic commit-only fallback", got)
+	}
+}
+
+func TestRunRepoLoopDoesNotDowngradeExplicitSyncWithoutRemote(t *testing.T) {
+	dir := t.TempDir()
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+
+	cfg, err := config.Parse([]byte("repositories:\n  - path: " + dir + "\n    mode: sync\n"))
+	if err != nil {
+		t.Fatalf("config.Parse: %v", err)
+	}
+	repo := cfg.Repositories[0]
+	repo.Settle = 20 * time.Millisecond
+	repo.MaxWait = 2 * time.Second
+	repo.FetchInterval = time.Hour
+	if !repo.ModeWasExplicitlySet() {
+		t.Fatal("explicit sync config did not mark mode as explicit")
+	}
+
+	git := &noRemoteFakeGit{fakeGit: &fakeGit{}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+
+	time.Sleep(50 * time.Millisecond)
+	git.fakeGit.markDirty()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return git.fakeGit.commitCount() >= 1 })
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down within 2s of context cancellation")
+	}
+
+	if got := git.ops(); len(got) == 0 {
+		t.Error("remote operations = [], want fetch for explicit sync mode")
+	}
+	sf, err := LoadStatusFile(statusPath)
+	if err != nil {
+		t.Fatalf("LoadStatusFile: %v", err)
+	}
+	if got := sf.Repos[dir].LastError; got == "" {
+		t.Error("LastError is empty, want fetch failure for explicit sync mode without a remote")
+	}
+}
+
+func TestResolveRepositoryModePreservesExplicitWorkflowWithoutRemote(t *testing.T) {
+	tests := map[string]struct {
+		yaml         string
+		wantMode     config.Mode
+		wantWorkflow config.WorkflowType
+	}{
+		"omitted mode": {
+			yaml:         "repositories:\n  - path: ~/notes\n",
+			wantMode:     config.ModeCommitOnly,
+			wantWorkflow: config.WorkflowAutoCommitOnly,
+		},
+		"explicit sync mode": {
+			yaml:         "repositories:\n  - path: ~/notes\n    mode: sync\n",
+			wantMode:     config.ModeSync,
+			wantWorkflow: config.WorkflowAutoCommitSync,
+		},
+		"explicit auto-commit-sync workflow": {
+			yaml:         "repositories:\n  - path: ~/notes\n    workflow:\n      type: auto-commit-sync\n",
+			wantMode:     config.ModeSync,
+			wantWorkflow: config.WorkflowAutoCommitSync,
+		},
+		"explicit committed-sync workflow": {
+			yaml:         "repositories:\n  - path: ~/notes\n    workflow:\n      type: committed-sync\n",
+			wantMode:     config.ModeCommittedSync,
+			wantWorkflow: config.WorkflowCommittedSync,
+		},
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := config.Parse([]byte(tt.yaml))
+			if err != nil {
+				t.Fatalf("config.Parse: %v", err)
+			}
+			repo := resolveRepositoryMode(&noRemoteFakeGit{fakeGit: &fakeGit{}}, cfg.Repositories[0], logger)
+			if repo.Mode != tt.wantMode || repo.Workflow != tt.wantWorkflow {
+				t.Errorf("resolved workflow = (%q, %q), want (%q, %q)", repo.Mode, repo.Workflow, tt.wantMode, tt.wantWorkflow)
+			}
+		})
 	}
 }
 

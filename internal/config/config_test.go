@@ -68,6 +68,9 @@ defaults:
 	if first.Settle != 3*time.Second || first.OnConflict != OnConflictClaude {
 		t.Errorf("Repositories[0] = %+v, want defaults applied", first)
 	}
+	if first.ModeWasExplicitlySet() {
+		t.Error("Repositories[0].ModeWasExplicitlySet() = true, want false without a mode setting")
+	}
 
 	second := cfg.Repositories[1]
 	if second.Settle != 5*time.Second {
@@ -78,6 +81,19 @@ defaults:
 	}
 	if second.MaxWait != 60*time.Second {
 		t.Errorf("Repositories[1].MaxWait = %v, want 60s (from defaults)", second.MaxWait)
+	}
+	if second.ModeWasExplicitlySet() {
+		t.Error("Repositories[1].ModeWasExplicitlySet() = true, want false without a mode setting")
+	}
+}
+
+func TestParseMinimalConfigLeavesModeImplicit(t *testing.T) {
+	cfg, err := Parse([]byte("repositories:\n  - path: ~/notes\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Repositories[0].ModeWasExplicitlySet(); got {
+		t.Error("Repositories[0].ModeWasExplicitlySet() = true, want false")
 	}
 }
 
@@ -216,8 +232,14 @@ defaults:
 	if got := cfg.Repositories[0].Mode; got != ModeCommitOnly {
 		t.Errorf("Repositories[0].Mode = %q, want %q (from defaults block)", got, ModeCommitOnly)
 	}
+	if !cfg.Repositories[0].ModeWasExplicitlySet() {
+		t.Error("Repositories[0].ModeWasExplicitlySet() = false, want true from defaults.mode")
+	}
 	if got := cfg.Repositories[1].Mode; got != ModeSync {
 		t.Errorf("Repositories[1].Mode = %q, want %q (per-repo override wins)", got, ModeSync)
+	}
+	if !cfg.Repositories[1].ModeWasExplicitlySet() {
+		t.Error("Repositories[1].ModeWasExplicitlySet() = false, want true from per-repository mode")
 	}
 }
 
@@ -252,6 +274,9 @@ repositories:
 	repo := cfg.Repositories[0]
 	if repo.Workflow != WorkflowCommittedSync || repo.Mode != ModeCommittedSync {
 		t.Fatalf("workflow = (%q, mode %q), want committed-sync", repo.Workflow, repo.Mode)
+	}
+	if !repo.WorkflowWasExplicitlySet() {
+		t.Error("WorkflowWasExplicitlySet() = false, want true for nested workflow")
 	}
 	if repo.Remote != "origin" || repo.Branch != "main" || repo.FetchInterval != time.Minute {
 		t.Errorf("repository overrides = %+v, want origin/main/1m", repo)

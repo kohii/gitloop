@@ -15,14 +15,13 @@ import (
 type Mode string
 
 const (
-	// ModeSync is the default: auto-commit, then fetch, integrate, and push
-	// against the configured remote.
+	// ModeSync auto-commits, then fetches, integrates, and pushes against the
+	// configured remote. It is also the parsed value for an omitted mode until
+	// the daemon checks whether the repository has any remotes.
 	ModeSync Mode = "sync"
 	// ModeCommitOnly stops the cycle after the auto-commit phase — no fetch,
-	// no merge, no push. It's for repositories with no remote at all, which
-	// under ModeSync would fail `git fetch` every cycle and so never report
-	// a healthy status. See docs/design.md for why it's an explicit opt-in
-	// rather than inferred from an unresolvable remote.
+	// no merge, no push. It is used for repositories with no remote when mode
+	// was omitted, as well as for repositories where users select it explicitly.
 	ModeCommitOnly Mode = "commit-only"
 	// ModeCommittedSync only transports commits that already exist in the
 	// repository. It never stages or creates a commit, fast-forwards only when
@@ -76,6 +75,10 @@ type Defaults struct {
 	// it overrides each repository's dynamic per-path default. See
 	// Repository.SaveLockPath.
 	SaveLockPath *string
+	// modeExplicit records whether defaults.mode was present in the config.
+	// It is copied into each repository so the daemon can distinguish an
+	// omitted mode from an explicit mode.
+	modeExplicit bool
 }
 
 // builtinDefaults are used for anything the config file's own top-level
@@ -127,6 +130,26 @@ type Repository struct {
 	// entirely; the external writer's config is responsible for pointing
 	// gitloop at whatever lock file they both agree to hold.
 	SaveLockPath string
+	// modeExplicit is true when mode was set on this repository or in the
+	// top-level defaults block. It is parser provenance used by the daemon,
+	// not a runtime configuration knob.
+	modeExplicit bool
+	// workflowExplicit is true when a nested workflow was present in the
+	// config. An explicitly selected workflow must not be auto-downgraded.
+	workflowExplicit bool
+}
+
+// ModeWasExplicitlySet reports whether this repository's effective mode came
+// from an explicit mode setting in the config file rather than the built-in
+// default.
+func (r Repository) ModeWasExplicitlySet() bool {
+	return r.modeExplicit
+}
+
+// WorkflowWasExplicitlySet reports whether this repository's workflow came
+// from a nested workflow setting in the config file.
+func (r Repository) WorkflowWasExplicitlySet() bool {
+	return r.workflowExplicit
 }
 
 // SyncsRemote reports whether this repository fetches, integrates, and
@@ -274,6 +297,7 @@ func resolveDefaults(raw rawDefaults) (Defaults, error) {
 			return Defaults{}, err
 		}
 		d.Mode = m
+		d.modeExplicit = true
 	}
 	if raw.Remote != "" {
 		d.Remote = raw.Remote
@@ -302,15 +326,17 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 	}
 
 	repo := Repository{
-		Path:          path,
-		Settle:        defaults.Settle,
-		MaxWait:       defaults.MaxWait,
-		FetchInterval: defaults.FetchInterval,
-		Mode:          defaults.Mode,
-		Workflow:      workflowForMode(defaults.Mode),
-		Remote:        defaults.Remote,
-		Branch:        defaults.Branch,
-		OnConflict:    defaults.OnConflict,
+		Path:             path,
+		Settle:           defaults.Settle,
+		MaxWait:          defaults.MaxWait,
+		FetchInterval:    defaults.FetchInterval,
+		Mode:             defaults.Mode,
+		Workflow:         workflowForMode(defaults.Mode),
+		Remote:           defaults.Remote,
+		Branch:           defaults.Branch,
+		OnConflict:       defaults.OnConflict,
+		modeExplicit:     defaults.modeExplicit || raw.Mode != "",
+		workflowExplicit: raw.Workflow != nil,
 	}
 
 	if repo.Settle, err = parseDurationOr(raw.Settle, repo.Settle, "settle"); err != nil {

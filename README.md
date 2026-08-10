@@ -28,7 +28,8 @@ repositories:
 ```
 
 Every other setting has a default (see below), so this is enough to start
-watching `~/notes` for changes and keep it synced with its `origin` remote.
+watching `~/notes` for changes. If it has a Git remote, gitloop syncs it using
+`origin`; if it has no remotes, gitloop automatically uses commit-only mode.
 
 A fuller example, overriding some settings per repository and some via the
 shared `defaults` block:
@@ -46,7 +47,7 @@ defaults:
   settle: 3s           # debounce: commit `settle` after the last file change
   max_wait: 60s        # ...but never wait longer than this while changes keep arriving
   fetch_interval: 30s  # also fetch on a timer, to notice remote-only changes
-  mode: sync           # "sync" (default) or "commit-only"
+  mode: sync           # optional: "sync" or "commit-only"
   remote: origin
   branch: ""           # empty = whatever is currently checked out
   on_conflict: backup  # "backup" (default) or "claude" (opt-in, falls back to backup)
@@ -67,13 +68,19 @@ repositories:
 ```
 
 The other workflow types correspond to the legacy `mode` values:
-`auto-commit-sync` is the default `sync` behavior and `auto-commit-only` is
-the default `commit-only` behavior. `mode: committed-sync` is also accepted
-as a legacy alias. A nested `workflow` cannot be combined with `mode`.
+`auto-commit-sync` is used when a remote-backed sync is selected and
+`auto-commit-only` is the local auto-commit behavior. `mode: committed-sync`
+is also accepted as a legacy alias. A nested `workflow` cannot be combined
+with `mode`.
 Workflow-specific fields that do not apply to the selected type are rejected
 at startup.
 
 `~` in `path` is expanded to the user's home directory.
+
+When `mode` is omitted, gitloop uses `sync` for repositories with at least one
+configured Git remote and automatically uses `commit-only` when no remotes are
+configured. An explicit `mode: sync` always remains sync mode, so a missing or
+misspelled `remote` is reported as an error instead of being silently ignored.
 
 `save_lock_path` is empty (disabled) by default. Set it explicitly — per
 repository or via the `defaults` block — when gitloop shares a working
@@ -159,12 +166,11 @@ into `git reflog`'s normal safety net.
 
 ### Commit-only repositories
 
-Not every repository has a remote. Under the default `mode: sync` such a
-repository still gets its edits auto-committed — a failed fetch never skips
-the commit phase — but `git fetch` fails on every single cycle, which leaves
-`last_error` permanently set and `last_successful_sync_at` permanently
-stale. That turns the one signal meant to tell you syncing has broken into
-constant noise.
+Not every repository has a remote. When `mode` is omitted, gitloop detects this
+and automatically uses `commit-only`, so the repository gets its edits
+auto-committed without repeatedly attempting a fetch that cannot succeed.
+The status remains healthy and `last_successful_sync_at` continues to mean
+that the configured behavior is working.
 
 `mode: commit-only` is the supported way to run gitloop purely as an
 auto-commit daemon:
@@ -175,18 +181,18 @@ repositories:
     mode: commit-only
 ```
 
-The cycle then stops after step 2 above: no fetch, no merge, no push, and
+The cycle then stops after the auto-commit phase: no fetch, no merge, no push, and
 `remote` / `branch` are unused. `gitloop status` reports `LAST_PUSH` as
 `n/a` for such a repository, so it can't be mistaken for a sync that has
 stalled. `fetch_interval` still applies: with nothing to fetch it becomes a
 periodic re-check that catches working-tree changes the file watcher missed
 (dropped events, or edits made while the daemon was down).
 
-Commit-only is an explicit opt-in rather than something gitloop infers from
-a remote that doesn't resolve, so a typo'd `remote:` name stays a loud
-failure instead of silently downgrading a synced repository to local-only
-commits. Setting it in the `defaults` block therefore stops *every*
-repository that doesn't say `mode: sync` from syncing.
+An explicit `mode: sync` remains a loud choice: a typo'd `remote:` name, or a
+repository with no remotes at all, stays a fetch failure instead of silently
+downgrading to local-only commits. Setting `mode: commit-only` in the
+`defaults` block therefore stops every repository that does not override it
+from syncing.
 
 ### Committed-sync repositories
 
