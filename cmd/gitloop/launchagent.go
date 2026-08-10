@@ -67,7 +67,8 @@ func bootstrapArgs(plistPath string) []string {
 }
 
 // bootoutArgs returns the launchctl arguments that stop and unload the
-// agent: `launchctl bootout gui/<uid>/<label>`.
+// agent. --wait is required before a replacement bootstrap: bootout can
+// return while launchd is still stopping the old process.
 func bootoutArgs() []string {
-	return []string{"bootout", fmt.Sprintf("gui/%d/%s", os.Getuid(), launchAgentLabel)}
+	return []string{"bootout", "--wait", fmt.Sprintf("gui/%d/%s", os.Getuid(), launchAgentLabel)}
 }

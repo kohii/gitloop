@@ -45,7 +45,7 @@ func TestBootstrapArgs(t *testing.T) {
 
 func TestBootoutArgs(t *testing.T) {
 	got := bootoutArgs()
-	want := []string{"bootout", fmt.Sprintf("gui/%d/dev.kohii.gitloop", os.Getuid())}
+	want := []string{"bootout", "--wait", fmt.Sprintf("gui/%d/dev.kohii.gitloop", os.Getuid())}
 	if len(got) != len(want) {
 		t.Fatalf("bootoutArgs = %v, want %v", got, want)
 	}
