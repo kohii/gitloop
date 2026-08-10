@@ -92,6 +92,7 @@ tree with another writer that agrees to hold the same lock. See
 ```sh
 gitloop run [--config <path>]        # start the daemon in the foreground
 gitloop install [--config <path>]    # register + start the launchd agent
+gitloop reload                       # validate config + restart the launchd agent
 gitloop uninstall                    # stop + remove the launchd agent
 gitloop status [--config <path>]     # show each repository's last sync state
 gitloop lock hold <path>             # hold a save-lock on <path> until stdin closes
@@ -120,6 +121,11 @@ Exit codes let the caller tell contention apart from real failures:
 and registers it with `launchctl bootstrap`. The agent restarts gitloop if
 it crashes (`KeepAlive`) and starts it at login (`RunAtLoad`). One agent
 runs regardless of how many repositories are configured.
+
+After editing the configuration, run `gitloop reload`. It validates the config
+path recorded in the installed plist and restarts the existing agent without
+rewriting the plist. Use `gitloop install --config <path>` when changing the
+config path or executable registration.
 
 `gitloop status` reads the daemon's status file (see below) and prints a
 table:

@@ -235,7 +235,9 @@ One agent, one process, regardless of how many repositories are configured
 — multi-repo support lives entirely inside the daemon (one goroutine per
 repository), not in the launchd layer. `KeepAlive` restarts the process if
 it crashes; `gitloop uninstall` runs `launchctl bootout gui/<uid>/dev.kohii.gitloop`
-and removes the plist.
+and removes the plist. `gitloop reload` validates the config path stored in
+the plist and uses `launchctl kickstart -k` to restart the existing agent
+without rewriting its registration.
 
 ## Status file
 

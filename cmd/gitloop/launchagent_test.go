@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -52,6 +53,68 @@ func TestBootoutArgs(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("bootoutArgs[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestKickstartArgs(t *testing.T) {
+	got := kickstartArgs()
+	want := []string{"kickstart", "-k", fmt.Sprintf("gui/%d/dev.kohii.gitloop", os.Getuid())}
+	if len(got) != len(want) {
+		t.Fatalf("kickstartArgs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("kickstartArgs[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestConfigPathFromPlist(t *testing.T) {
+	dir := t.TempDir()
+	want := filepath.Join(dir, "config&shared.yaml")
+	plistPath := filepath.Join(dir, "agent.plist")
+	if err := os.WriteFile(plistPath, []byte(buildPlist("/usr/local/bin/gitloop", want, filepath.Join(dir, "gitloop.log"))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := configPathFromPlist(plistPath)
+	if err != nil {
+		t.Fatalf("configPathFromPlist: %v", err)
+	}
+	if got != want {
+		t.Errorf("configPathFromPlist = %q, want %q", got, want)
+	}
+}
+
+func TestConfigPathFromPlistAcceptsEqualsForm(t *testing.T) {
+	plistPath := filepath.Join(t.TempDir(), "agent.plist")
+	plist := `<?xml version="1.0" encoding="UTF-8"?>
+<plist><dict>
+	<key>ProgramArguments</key>
+	<array><string>/usr/local/bin/gitloop</string><string>run</string><string>--config=/tmp/config.yaml</string></array>
+</dict></plist>`
+	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := configPathFromPlist(plistPath)
+	if err != nil {
+		t.Fatalf("configPathFromPlist: %v", err)
+	}
+	if got != "/tmp/config.yaml" {
+		t.Errorf("configPathFromPlist = %q, want /tmp/config.yaml", got)
+	}
+}
+
+func TestBuildPlistEscapesXMLValues(t *testing.T) {
+	plist := buildPlist("/bin/gitloop", "/tmp/config&shared.yaml", "/tmp/log<1>.log")
+	for _, want := range []string{
+		"<string>/tmp/config&amp;shared.yaml</string>",
+		"<string>/tmp/log&lt;1&gt;.log</string>",
+	} {
+		if !strings.Contains(plist, want) {
+			t.Errorf("plist missing escaped value %q:\n%s", want, plist)
 		}
 	}
 }

@@ -21,6 +21,7 @@ Usage:
 Commands:
   run         Start the sync daemon in the foreground
   install     Install and start the launchd agent
+  reload      Validate the installed config and restart the launchd agent
   uninstall   Stop and remove the launchd agent
   status      Show each configured repository's last known sync state
   lock        Advisory-lock helpers for external writers (see "gitloop lock -h")
@@ -51,6 +52,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runCmd(rest, stdout, stderr)
 	case "install":
 		return installCmd(rest, stdout, stderr)
+	case "reload":
+		return reloadCmd(rest, stdout, stderr)
 	case "uninstall":
 		return uninstallCmd(rest, stdout, stderr)
 	case "status":
