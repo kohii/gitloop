@@ -331,6 +331,13 @@ func TestParseWorkflowRejectsInvalidCombinations(t *testing.T) {
     mode: commit-only
     remote_timeout: 1m
 `,
+		"duplicate remote timeout": `repositories:
+  - path: ~/notes
+    remote_timeout: 2m
+    workflow:
+      type: auto-commit-sync
+      remote_timeout: 1m
+`,
 		"duplicate conflict policy": `repositories:
   - path: ~/notes
     on_conflict: claude

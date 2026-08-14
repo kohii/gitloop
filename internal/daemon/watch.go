@@ -163,6 +163,10 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			err := git.Push(remoteCtx, repo.Remote, branch)
 			cancel()
 			if ctx.Err() != nil {
+				if err == nil {
+					result.Pushed = true
+					applyCycleResult(recorder, repo.Path, result, logger)
+				}
 				return
 			}
 			if err != nil {
@@ -257,19 +261,21 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 }
 
 // remoteCommandContext applies the repository's network-operation policy
-// while preserving cancellation from daemon shutdown. A zero timeout is
-// accepted for hand-built Repository values in tests and means parent-only
-// cancellation; parsed production configuration always supplies a positive
-// timeout.
+// while preserving cancellation from daemon shutdown. Parsed configuration
+// always supplies a positive value; the fallback keeps hand-built Repository
+// values finite as a defense in depth.
 func remoteCommandContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
-		return context.WithCancel(parent)
+		timeout = config.DefaultRemoteTimeout
 	}
 	return context.WithTimeout(parent, timeout)
 }
 
 func annotateRemoteError(err error, timeout time.Duration) error {
 	if errors.Is(err, context.DeadlineExceeded) {
+		if timeout <= 0 {
+			timeout = config.DefaultRemoteTimeout
+		}
 		return fmt.Errorf("timed out after %s: %w", timeout, err)
 	}
 	return err

@@ -73,6 +73,10 @@ members after a grace period or once Git itself has exited. The group boundary
 matters because Git delegates network I/O to transports such as SSH; killing
 only Git can leave that child alive indefinitely.
 
+`remote_timeout` is the point at which termination begins, not the final return
+deadline. A remote operation may take the short TERM grace and pipe-drain delay
+beyond it before the repository loop resumes.
+
 Local operations have no generic deadline. Interrupting commit or merge can
 leave the index or working tree in an intermediate state, while a failed
 remote operation can safely be retried from repository state on the next

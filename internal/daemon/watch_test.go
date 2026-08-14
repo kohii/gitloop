@@ -751,6 +751,72 @@ func TestRunRepoLoopCommitsAfterFetchTimeout(t *testing.T) {
 	}
 }
 
+type blockingPushFakeGit struct {
+	*fakeGit
+	started chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingPushFakeGit) RevListLeftRightCount(string, string) (int, int, error) {
+	return 1, 0, nil
+}
+
+func (f *blockingPushFakeGit) Push(ctx context.Context, _, _ string) error {
+	f.once.Do(func() { close(f.started) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestRunRepoLoopReportsPushTimeout(t *testing.T) {
+	dir := t.TempDir()
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	git := &blockingPushFakeGit{fakeGit: &fakeGit{}, started: make(chan struct{})}
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        20 * time.Millisecond,
+		MaxWait:       2 * time.Second,
+		FetchInterval: time.Hour,
+		RemoteTimeout: 60 * time.Millisecond,
+		Mode:          config.ModeSync,
+		Remote:        "origin",
+		Branch:        "main",
+		OnConflict:    config.OnConflictBackup,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	time.Sleep(50 * time.Millisecond)
+	git.markDirty()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	select {
+	case <-git.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("push did not start")
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		sf, loadErr := LoadStatusFile(statusPath)
+		if loadErr != nil {
+			return false
+		}
+		return strings.Contains(sf.Repos[dir].LastError, "push: timed out after 60ms")
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down")
+	}
+}
+
 func TestRunRepoLoopCancellationInterruptsFetch(t *testing.T) {
 	dir := t.TempDir()
 	git := &blockingFetchFakeGit{fakeGit: &fakeGit{}, started: make(chan struct{})}
@@ -789,6 +855,74 @@ func TestRunRepoLoopCancellationInterruptsFetch(t *testing.T) {
 	}
 	if got := git.commitCount(); got != 0 {
 		t.Fatalf("commit count after cancellation = %d, want 0", got)
+	}
+}
+
+type cancelingPushFakeGit struct {
+	*fakeGit
+	cancel context.CancelFunc
+}
+
+func (f *cancelingPushFakeGit) RevListLeftRightCount(string, string) (int, int, error) {
+	return 1, 0, nil
+}
+
+func (f *cancelingPushFakeGit) Push(context.Context, string, string) error {
+	f.cancel()
+	return nil
+}
+
+func TestRunRepoLoopRecordsPushThatFinishesDuringShutdown(t *testing.T) {
+	dir := t.TempDir()
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	ctx, cancel := context.WithCancel(context.Background())
+	git := &cancelingPushFakeGit{fakeGit: &fakeGit{}, cancel: cancel}
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        time.Second,
+		MaxWait:       2 * time.Second,
+		FetchInterval: time.Hour,
+		RemoteTimeout: time.Hour,
+		Mode:          config.ModeCommittedSync,
+		Remote:        "origin",
+		Branch:        "main",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runRepoLoop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down")
+	}
+	sf, err := LoadStatusFile(statusPath)
+	if err != nil {
+		t.Fatalf("LoadStatusFile: %v", err)
+	}
+	if got := sf.Repos[dir]; got.LastPush == "" || got.LastError != "" {
+		t.Errorf("status after successful push during shutdown = %+v, want push recorded and no error", got)
+	}
+}
+
+func TestRemoteCommandContextUsesFiniteDefaultForZeroValue(t *testing.T) {
+	started := time.Now()
+	ctx, cancel := remoteCommandContext(context.Background(), 0)
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("zero-value timeout produced a context without a deadline")
+	}
+	remaining := deadline.Sub(started)
+	if remaining < config.DefaultRemoteTimeout-time.Second || remaining > config.DefaultRemoteTimeout+time.Second {
+		t.Errorf("default deadline remaining = %v, want approximately %v", remaining, config.DefaultRemoteTimeout)
 	}
 }
 

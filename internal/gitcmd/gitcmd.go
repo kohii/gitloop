@@ -95,6 +95,13 @@ func (r *Runner) runRemote(ctx context.Context, args ...string) (Result, error) 
 	}
 
 	res, runErr := r.runCommand(cmd, args)
+	// WaitDelay also fires after a successful process exit when an unrelated
+	// descendant inherited stdout or stderr. The pipe has been closed by exec
+	// at this point, and Git's successful ProcessState remains authoritative.
+	if errors.Is(runErr, exec.ErrWaitDelay) && !cancellationStarted.Load() &&
+		cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		runErr = nil
+	}
 	// The direct git process can exit on SIGTERM before a transport child that
 	// ignored the same signal. Once git itself is gone there is no useful
 	// graceful work left for those descendants to perform, so reap any
@@ -106,7 +113,9 @@ func (r *Runner) runRemote(ctx context.Context, args ...string) (Result, error) 
 	if ctxErr := ctx.Err(); cancellationStarted.Load() && ctxErr != nil && runErr != nil {
 		var gitErr *Error
 		if errors.As(runErr, &gitErr) {
-			gitErr.Err = errors.Join(ctxErr, gitErr.Err)
+			// Multiple %w operands preserve errors.Is for both causes without
+			// errors.Join's newline, which would corrupt tabular status output.
+			gitErr.Err = fmt.Errorf("%w: %w", ctxErr, gitErr.Err)
 		}
 	}
 	return res, runErr

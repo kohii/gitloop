@@ -24,9 +24,13 @@ func TestFetchTimeoutKillsTransportAndAllowsNextFetch(t *testing.T) {
 	t.Setenv("GIT_SSH_COMMAND", transport)
 
 	runIn(t, localDir, "remote", "add", "origin", "ssh://example.invalid/repository")
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	defer cancel()
-	err := runner.Fetch(ctx, "origin")
+	ctx := &triggeredDeadlineContext{done: make(chan struct{})}
+	errCh := make(chan error, 1)
+	go func() { errCh <- runner.Fetch(ctx, "origin") }()
+	readRecordedPID(t, filepath.Join(pidDir, "parent.pid"))
+	readRecordedPID(t, filepath.Join(pidDir, "child.pid"))
+	close(ctx.done)
+	err := <-errCh
 	if err == nil {
 		t.Fatal("Fetch = nil, want timeout")
 	}
@@ -41,7 +45,50 @@ func TestFetchTimeoutKillsTransportAndAllowsNextFetch(t *testing.T) {
 	nextCtx, nextCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer nextCancel()
 	if err := runner.Fetch(nextCtx, "origin"); err != nil {
-		t.Fatalf("Fetch after timeout = %v, want success without a stale lock or process", err)
+		t.Fatalf("Fetch after timeout = %v, want success after transport cleanup", err)
+	}
+}
+
+type triggeredDeadlineContext struct {
+	done chan struct{}
+}
+
+func (c *triggeredDeadlineContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *triggeredDeadlineContext) Done() <-chan struct{}       { return c.done }
+func (c *triggeredDeadlineContext) Value(any) any               { return nil }
+func (c *triggeredDeadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func TestRemoteSuccessIgnoresWaitDelayFromInheritedPipe(t *testing.T) {
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "child.pid")
+	executable := filepath.Join(t.TempDir(), "successful-command")
+	script := `#!/bin/sh
+/bin/sh -c 'sleep 30' &
+echo $! > "` + pidPath + `"
+echo success
+`
+	if err := os.WriteFile(executable, []byte(script), 0o755); err != nil {
+		t.Fatalf("write successful command: %v", err)
+	}
+	runner := New(dir)
+	runner.executable = executable
+	runner.terminationGrace = 50 * time.Millisecond
+
+	res, err := runner.runRemote(context.Background(), "fetch", "origin")
+	childPID := readRecordedPID(t, pidPath)
+	defer syscall.Kill(childPID, syscall.SIGKILL)
+	if err != nil {
+		t.Fatalf("runRemote = %v, want Git process success to win over WaitDelay", err)
+	}
+	if strings.TrimSpace(res.Stdout) != "success" {
+		t.Errorf("stdout = %q, want success", res.Stdout)
 	}
 }
 
@@ -62,6 +109,9 @@ func TestPushCancellationKillsCommandProcessGroup(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "transport stalled") {
 		t.Errorf("Push error = %q, want captured command stderr", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("Push error contains a newline that would corrupt status output: %q", err)
 	}
 	assertRecordedProcessesGone(t, dir)
 }

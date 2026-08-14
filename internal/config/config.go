@@ -40,6 +40,10 @@ const (
 	WorkflowCommittedSync  WorkflowType = "committed-sync"
 )
 
+// DefaultRemoteTimeout bounds each individual fetch or push when no explicit
+// timeout is configured.
+const DefaultRemoteTimeout = 10 * time.Minute
+
 // OnConflict selects how gitloop resolves a real (non-fast-forwardable)
 // merge conflict.
 type OnConflict string
@@ -89,7 +93,7 @@ var builtinDefaults = Defaults{
 	Settle:        3 * time.Second,
 	MaxWait:       60 * time.Second,
 	FetchInterval: 30 * time.Second,
-	RemoteTimeout: 10 * time.Minute,
+	RemoteTimeout: DefaultRemoteTimeout,
 	Mode:          ModeSync,
 	Remote:        "origin",
 	Branch:        "",
