@@ -166,6 +166,45 @@ func behindRepo(t *testing.T, dir, upstreamFile string) *Runner {
 	return r
 }
 
+// TestMergeFFSucceedsWithUnrelatedLocalChanges pins the git behavior that
+// lets committed-sync attempt a fast-forward over a dirty working tree: only
+// the paths the incoming commits rewrite are in the way.
+func TestMergeFFSucceedsWithUnrelatedLocalChanges(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := behindRepo(t, dir, "b.md")
+	writeFile(t, dir, "a.md", "a uncommitted\n")
+
+	if err := r.MergeFF("upstream"); err != nil {
+		t.Fatalf("MergeFF with an unrelated dirty file: %v", err)
+	}
+	if got := readFile(t, dir, "b.md"); got != "upstream\n" {
+		t.Errorf("b.md = %q, want the upstream content", got)
+	}
+	if got := readFile(t, dir, "a.md"); got != "a uncommitted\n" {
+		t.Errorf("a.md = %q, want the uncommitted content preserved", got)
+	}
+}
+
+// TestMergeFFRefusesToOverwriteLocalChanges is the other half of that
+// contract, and the reason no pre-flight check is needed: git turns the
+// merge down without having written anything.
+func TestMergeFFRefusesToOverwriteLocalChanges(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := behindRepo(t, dir, "a.md")
+	writeFile(t, dir, "a.md", "uncommitted\n")
+
+	if err := r.MergeFF("upstream"); err == nil {
+		t.Fatal("MergeFF() = nil, want a refusal to overwrite local changes")
+	}
+	if got := readFile(t, dir, "a.md"); got != "uncommitted\n" {
+		t.Errorf("a.md = %q, want the uncommitted content left alone", got)
+	}
+}
+
 // TestMergeFFIgnoresConfiguredAutostash guards the refusal above against a
 // user's own git config. With merge.autostash left on, git stashes, fast-
 // forwards, fails to unstash, and still exits 0 — handing a daemon a

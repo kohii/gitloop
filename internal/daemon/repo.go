@@ -133,14 +133,12 @@ func runIntegratePhase(git GitClient, repo config.Repository, hostname string, l
 }
 
 // runCommittedSyncPhase transports only commits that already exist. It never
-// stages or creates a commit, never merges divergent histories, and only
-// fast-forwards a clean working tree. A push is safe with a dirty working
-// tree because it changes the remote ref, not the checkout.
+// stages or creates a commit and never merges divergent histories. A push is
+// safe with a dirty working tree because it changes the remote ref, not the
+// checkout, and a fast-forward is left to git to accept or refuse.
 //
-// The caller holds the configured save lock. The dirty check is repeated
-// immediately before a fast-forward so a cooperating writer cannot save
-// between classification and integration. With save-lock coordination
-// disabled, git's own clean-tree checks remain the final guard, but external
+// The caller holds the configured save lock. With save-lock coordination
+// disabled, git's own overwrite checks remain the guard, but external
 // writers have no advisory-lock handshake with the daemon.
 func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.Logger) (result cycleResult, branch string, needPush bool) {
 	var err error
@@ -151,13 +149,6 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 	}
 	upstream := repo.Remote + "/" + branch
 
-	entries, err := git.StatusPorcelain()
-	if err != nil {
-		result.Err = fmt.Errorf("status: %w", err)
-		return
-	}
-	dirty := len(entries) > 0
-
 	ahead, behind, err := git.RevListLeftRightCount(branch, upstream)
 	if err != nil {
 		result.Err = fmt.Errorf("rev-list: %w", err)
@@ -165,7 +156,7 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 	}
 	state := statemachine.Classify(ahead, behind)
 	result.Action = statemachine.ActionFor(state)
-	logger.Info("classified committed-sync state", "state", state.String(), "ahead", ahead, "behind", behind, "dirty", dirty)
+	logger.Info("classified committed-sync state", "state", state.String(), "ahead", ahead, "behind", behind)
 
 	switch state {
 	case statemachine.Equal:
@@ -175,25 +166,21 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 		needPush = true
 
 	case statemachine.Behind:
-		if dirty {
-			result.BlockedReason = BlockedDirtyBehind
-			result.Err = fmt.Errorf("working tree is dirty; postponing fast-forward")
-			return
-		}
-		// Re-check after classification and immediately before changing the
-		// checkout. This is the last safe point before git mutates files.
-		entries, err = git.StatusPorcelain()
-		if err != nil {
-			result.Err = fmt.Errorf("status before fast-forward: %w", err)
-			return
-		}
-		if len(entries) > 0 {
-			result.BlockedReason = BlockedDirtyBehind
-			result.Err = fmt.Errorf("working tree became dirty; postponing fast-forward")
-			return
-		}
+		// Ask git instead of pre-screening the working tree. `git merge
+		// --ff-only` refuses — before touching a single file — exactly when
+		// checking out the incoming tree would overwrite modified or
+		// untracked content, and accepts everything else. Uncommitted work in
+		// files the incoming commits leave alone, the usual case for two
+		// machines editing different parts of one checkout, therefore no
+		// longer holds the branch behind upstream. Trying and being refused
+		// is also atomic in a way a status check followed by a merge is not.
 		if err := git.MergeFF(upstream); err != nil {
-			result.Err = fmt.Errorf("fast-forward merge: %w", err)
+			if refusedOverUncommittedWork(git) {
+				result.BlockedReason = BlockedDirtyBehind
+				result.Err = fmt.Errorf("postponing fast-forward: %w", err)
+			} else {
+				result.Err = fmt.Errorf("fast-forward merge: %w", err)
+			}
 			return
 		}
 
@@ -202,6 +189,20 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 		result.Err = fmt.Errorf("local and upstream histories diverged; manual merge required")
 	}
 	return
+}
+
+// refusedOverUncommittedWork labels a refused fast-forward without parsing
+// git's localizable message. Uncommitted work is the refusal to expect here,
+// so a dirty tree earns the blocked status that tells the user what to do.
+//
+// The attribution is a guess, not a diagnosis: the Behind classification is
+// already stale by the time the merge runs, so a human committing in between
+// produces a divergence that gets reported as a dirty tree. Only the label is
+// at stake — the git error saying what actually happened is kept either way.
+func refusedOverUncommittedWork(git GitClient) bool {
+	// A status that won't even read is no basis for blaming the user's edits.
+	entries, err := git.StatusPorcelain()
+	return err == nil && len(entries) > 0
 }
 
 // checkedOutBranch resolves the branch to operate on and refuses to use a

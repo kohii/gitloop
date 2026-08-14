@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -14,8 +15,12 @@ import (
 type committedSyncFakeGit struct {
 	*fakeGit
 	ahead, behind int
-	ffCount       int
-	pushCount     int
+	// ffErr stands in for git's refusal to fast-forward. Real git only
+	// refuses when checking out the incoming tree would overwrite something,
+	// so a fake that fails while dirty models a genuine collision.
+	ffErr     error
+	ffCount   int
+	pushCount int
 }
 
 type checkedOutBranchFakeGit struct {
@@ -32,6 +37,9 @@ func (f *committedSyncFakeGit) RevListLeftRightCount(string, string) (int, int, 
 }
 
 func (f *committedSyncFakeGit) MergeFF(string) error {
+	if f.ffErr != nil {
+		return f.ffErr
+	}
 	f.ffCount++
 	return nil
 }
@@ -45,6 +53,9 @@ func (f *committedSyncFakeGit) Push(string, string) error {
 	return nil
 }
 
+// errRefusedFF stands in for git declining to move the checkout forward.
+var errRefusedFF = errors.New("local changes would be overwritten by merge")
+
 func committedSyncRepo() config.Repository {
 	return config.Repository{
 		Path:       "/repo",
@@ -56,7 +67,7 @@ func committedSyncRepo() config.Repository {
 }
 
 func TestRunCommittedSyncPhaseNeverCommitsDirtyChanges(t *testing.T) {
-	git := &committedSyncFakeGit{fakeGit: &fakeGit{dirty: true}, ahead: 0, behind: 1}
+	git := &committedSyncFakeGit{fakeGit: &fakeGit{dirty: true}, ahead: 0, behind: 1, ffErr: errRefusedFF}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	result, _, needPush := runCommittedSyncPhase(git, committedSyncRepo(), logger)
@@ -89,7 +100,7 @@ func TestRunCommittedSyncPhasePushesExistingCommitsWithDirtyTree(t *testing.T) {
 	}
 }
 
-func TestRunCommittedSyncPhaseFastForwardsOnlyCleanTree(t *testing.T) {
+func TestRunCommittedSyncPhaseFastForwardsCleanTree(t *testing.T) {
 	git := &committedSyncFakeGit{fakeGit: &fakeGit{}, ahead: 0, behind: 1}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -97,6 +108,43 @@ func TestRunCommittedSyncPhaseFastForwardsOnlyCleanTree(t *testing.T) {
 
 	if result.Err != nil || needPush || git.ffCount != 1 {
 		t.Errorf("clean behind result = err:%v needPush:%v ff:%d, want nil/false/1", result.Err, needPush, git.ffCount)
+	}
+}
+
+// TestRunCommittedSyncPhaseFastForwardsOverADirtyTree pins the point of
+// leaving the decision to git: uncommitted work no longer pre-empts the
+// fast-forward, so a checkout stays current while unrelated files are edited.
+func TestRunCommittedSyncPhaseFastForwardsOverADirtyTree(t *testing.T) {
+	git := &committedSyncFakeGit{fakeGit: &fakeGit{dirty: true}, ahead: 0, behind: 1}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	result, _, needPush := runCommittedSyncPhase(git, committedSyncRepo(), logger)
+
+	if result.Err != nil || result.BlockedReason != "" {
+		t.Fatalf("result = err:%v reason:%q, want nil/empty", result.Err, result.BlockedReason)
+	}
+	if git.ffCount != 1 {
+		t.Errorf("ffCount = %d, want 1: a dirty tree git is willing to fast-forward must not block", git.ffCount)
+	}
+	if needPush || git.commitCount() != 0 {
+		t.Errorf("phase overreached: needPush=%v commits=%d", needPush, git.commitCount())
+	}
+}
+
+// TestRunCommittedSyncPhaseLeavesACleanTreeRefusalUnclassified keeps the
+// dirty-working-tree status honest: a fast-forward that fails for some other
+// reason must surface the git error rather than blame the user's edits.
+func TestRunCommittedSyncPhaseLeavesACleanTreeRefusalUnclassified(t *testing.T) {
+	git := &committedSyncFakeGit{fakeGit: &fakeGit{}, ahead: 0, behind: 1, ffErr: errRefusedFF}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	result, _, _ := runCommittedSyncPhase(git, committedSyncRepo(), logger)
+
+	if result.Err == nil {
+		t.Fatal("Err = nil, want the underlying fast-forward failure")
+	}
+	if result.BlockedReason != "" {
+		t.Errorf("BlockedReason = %q, want empty on a clean tree", result.BlockedReason)
 	}
 }
 
