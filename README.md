@@ -144,10 +144,12 @@ PATH                PHASE  LAST_COMMIT                LAST_PUSH                 
 ```
 
 The `BLOCKED` column reports why a committed-sync repository is waiting:
-`dirty-working-tree`, `diverged-history`, or `operation-in-progress`. The last
-one means the checkout has a merge or rebase part-way through — gitloop stays
-out of it entirely, including one of its own left behind by a daemon that was
-killed mid-replay, so syncing resumes once you finish or `--abort` it.
+`dirty-working-tree`, `diverged-history`, or `operation-in-progress`, with
+`LAST_ERROR` giving the detail. The last covers two situations: another writer
+is holding the save lock, or the checkout has a merge or rebase part-way
+through. gitloop stays out of the latter entirely — including one of its own,
+left behind by a daemon killed mid-replay — so syncing resumes once you finish
+or `--abort` it.
 
 ## Sync behavior
 
@@ -246,9 +248,10 @@ commit, and the commits it rewrites are unpushed ones nothing else can be built
 on. The same edit committed on two machines is dropped by Git's patch-id check
 instead of conflicting. A rebase needs a clean working tree, so uncommitted
 changes defer it, and a replay that hits a real conflict is aborted — leaving
-the branch exactly as it was — and left to you. A failed replay is not retried
-until one side commits something new; the same divergence would only fail the
-same way.
+the branch exactly as it was — and left to you. That conflict is not replayed
+again until one side commits something new, since the same divergence would
+only fail the same way; a replay stopped by something that can pass, such as an
+unavailable signing key, is retried on the next `interval` tick.
 
 Replaying rather than merging has two consequences worth knowing:
 

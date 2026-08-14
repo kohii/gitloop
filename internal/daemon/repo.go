@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -129,6 +130,9 @@ func runIntegratePhase(git GitClient, repo config.Repository, hostname string, l
 			result.Conflict = backup
 		}
 		needPush = true
+
+	default:
+		result.Err = fmt.Errorf("auto-commit-sync has no handling for action %s", action)
 	}
 	return
 }
@@ -142,9 +146,25 @@ func runIntegratePhase(git GitClient, repo config.Repository, hostname string, l
 // file events that schedule the next cycle. Without this guard, one conflicting
 // divergence has the daemon replaying and aborting the same rebase every settle
 // window — fetching the remote each time — until a human intervenes.
+// Only a divergence needs guarding. A refused fast-forward or rebase is
+// declined by git before it writes anything, so nothing about it wakes the
+// watcher.
 type replayGuard struct {
 	local    string
 	upstream string
+	// reason and err are the failure itself, replayed verbatim on the cycles
+	// that are suppressed. Re-deriving a reason there would report every
+	// suppressed cycle as a divergence to merge by hand, including the ones
+	// that stopped over a locked signing key or a failing hook — and the
+	// status file only keeps the most recent cycle, so that is all a user
+	// would ever see.
+	reason string
+	err    error
+	// transient marks a failure whose cause can pass on its own, unlike a
+	// conflict, which stands until someone resolves it. Neither side of the
+	// divergence moves when a signing key is unlocked or a hook is fixed, so
+	// without this the repository would stay stopped until the next commit.
+	transient bool
 }
 
 // blocks reports whether this is the same divergence — both sides still at the
@@ -154,8 +174,17 @@ func (g *replayGuard) blocks(local, upstream string) bool {
 	return g.local != "" && g.local == local && g.upstream == upstream
 }
 
-func (g *replayGuard) remember(local, upstream string) {
-	g.local, g.upstream = local, upstream
+func (g *replayGuard) remember(local, upstream, reason string, err error, transient bool) {
+	g.local, g.upstream, g.reason, g.err, g.transient = local, upstream, reason, err, transient
+}
+
+// retryTransientFailure lets a replay that stopped over something fixable be
+// attempted once more. The caller times this: the periodic cycle is a rate
+// limit the working tree's own file events are not.
+func (g *replayGuard) retryTransientFailure() {
+	if g.transient {
+		*g = replayGuard{}
+	}
 }
 
 // runCommittedSyncPhase transports only commits that already exist. It never
@@ -213,7 +242,10 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, guard *replayG
 		}
 
 	case statemachine.RebaseThenPush:
-		result.BlockedReason, needPush, result.Err = replayDivergence(git, branch, upstream, guard, logger)
+		result.BlockedReason, needPush, result.Err = replayDivergence(git, upstream, guard, logger)
+
+	default:
+		result.Err = fmt.Errorf("committed-sync has no handling for action %s", action)
 	}
 	return
 }
@@ -224,22 +256,25 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, guard *replayG
 // branch is the ordinary way a shared checkout diverges, and neither side's
 // commits need a human to reconcile them. Rewriting them is safe because they
 // are unpushed — that is what Ahead means.
-func replayDivergence(git GitClient, branch, upstream string, guard *replayGuard, logger *slog.Logger) (blockedReason string, needPush bool, err error) {
-	localHead, err := git.RevParse(branch)
+func replayDivergence(git GitClient, upstream string, guard *replayGuard, logger *slog.Logger) (blockedReason string, needPush bool, err error) {
+	// HEAD rather than the branch name: `git rev-parse main` answers with a
+	// tag of that name before the branch, and a guard keyed on a commit that
+	// can never move would stop the repository for good. The branch is the
+	// checked-out one — checkedOutBranch has already insisted on that.
+	localHead, err := git.RevParse("HEAD")
 	if err != nil {
-		return "", false, fmt.Errorf("resolving %s: %w", branch, err)
+		return "", false, fmt.Errorf("resolving HEAD: %w", err)
 	}
 	upstreamHead, err := git.RevParse(upstream)
 	if err != nil {
 		return "", false, fmt.Errorf("resolving %s: %w", upstream, err)
 	}
 	if guard.blocks(localHead, upstreamHead) {
-		return BlockedDiverged, false, fmt.Errorf("replaying local commits onto %s already failed and neither side has moved since; manual merge required", upstream)
+		return guard.reason, false, guard.err
 	}
 
 	paused, err := git.Rebase(upstream)
 	if paused {
-		guard.remember(localHead, upstreamHead)
 		// A conflict is the divergence the user has to merge by hand; a
 		// failing commit hook or an unavailable signing key pauses a rebase
 		// identically and needs a different fix entirely, so the blocked
@@ -251,15 +286,23 @@ func replayDivergence(git GitClient, branch, upstream string, guard *replayGuard
 		if len(conflicted) > 0 {
 			blockedReason = BlockedDiverged
 		}
+		err = fmt.Errorf("replaying local commits onto %s stopped: %w", upstream, err)
+		guard.remember(localHead, upstreamHead, blockedReason, err, len(conflicted) == 0)
 		// Leaving the rebase paused would block every later cycle at PreCheck
 		// and hand the user a half-applied branch to reason about. Abort puts
 		// the branch and working tree back exactly as they were.
 		if abortErr := git.RebaseAbort(); abortErr != nil {
 			return "", false, fmt.Errorf("replaying local commits onto %s stopped and could not be aborted: %w", upstream, abortErr)
 		}
-		return blockedReason, false, fmt.Errorf("replaying local commits onto %s stopped: %w", upstream, err)
+		return blockedReason, false, err
 	}
 	if err != nil {
+		if errors.Is(err, gitcmd.ErrOperationInProgress) {
+			// Someone else's merge or rebase. It leaves the working tree
+			// dirty, so the check below would otherwise blame the user's
+			// edits for a refusal that has nothing to do with them.
+			return BlockedOperation, false, err
+		}
 		// A rebase, unlike a fast-forward, refuses over any uncommitted change
 		// rather than only the ones in its way — so this is the refusal to
 		// expect on a shared checkout, labeled the same way.

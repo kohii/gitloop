@@ -163,11 +163,26 @@ Git enforces the pre-conditions, as it does for the fast-forward above:
   commit hook or an unavailable signing key pauses a rebase identically, and
   telling the user to merge by hand would send them after the wrong problem.
 
-A failed replay is not retried until one side commits something new
+A failed replay is not retried on the file events it produced itself
 (`replayGuard`). This is not an optimization: the rebase rewrites the working
-tree and so does the abort that undoes it, and those writes are the file events
-that schedule the next cycle, so a conflicting divergence would replay every
-settle window — fetching the remote each time — for as long as it stood.
+tree and so does the abort that undoes it, and those writes are what schedules
+the next cycle, so a conflicting divergence would replay every settle window —
+fetching the remote each time — for as long as it stood. The guard therefore
+keys on the (local, upstream) commit pair, and releases when either side moves.
+
+A pause that was not a conflict is released by the periodic cycle as well,
+because nothing about the divergence changes when a locked signing key is
+unlocked or a failing hook is fixed — the guard would otherwise hold the
+repository long after the cause was gone. The interval is the rate limit that
+the file-event triggers are not, so the retry can't reopen the loop above.
+Conflicts are excluded: one stands until someone resolves it, and retrying it
+every tick would rewrite and restore the working tree indefinitely.
+
+The auto-commit workflow has the same shape available to it and does not use
+it: a `resolveConflicts` failure aborts the merge, and the merge and abort
+write the working tree the same way. It takes a conflict policy failing (the
+`backup` default does not fail) to get there, which is why the guard is
+committed-sync's alone for now.
 
 A plain rebase replays commits individually, so an unpushed merge commit of the
 user's own is flattened. `--rebase-merges` would keep the shape at the cost of

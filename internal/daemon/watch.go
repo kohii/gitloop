@@ -264,6 +264,13 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			// working tree, so reusing the same cycle here naturally gives
 			// us "fetch, and integrate if behind/diverged" without a
 			// separate code path.
+			//
+			// This is also the one trigger that may retry a replay that
+			// stopped over something fixable, such as a signing key that was
+			// locked at the time. It is rate-limited by the interval, where
+			// the file-event triggers above are not — and the failed replay's
+			// own writes are among those events.
+			replay.retryTransientFailure()
 			runCycle("fetch-interval")
 		}
 	}

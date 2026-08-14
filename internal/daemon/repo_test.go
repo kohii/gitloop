@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kohii/gitloop/internal/config"
+	"github.com/kohii/gitloop/internal/gitcmd"
 	"github.com/kohii/gitloop/internal/statemachine"
 )
 
@@ -301,8 +302,9 @@ func TestRunCommittedSyncPhaseDoesNotBlameADivergenceForAnUnrelatedPause(t *test
 	git.rebasePauseErr = errors.New("gpg failed to sign the data")
 	git.conflicted = nil
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	guard := &replayGuard{}
 
-	result, _, _ := runCommittedSyncPhase(git, committedSyncRepo(), &replayGuard{}, logger)
+	result, _, _ := runCommittedSyncPhase(git, committedSyncRepo(), guard, logger)
 
 	if result.BlockedReason != "" {
 		t.Errorf("BlockedReason = %q, want empty: nothing conflicted", result.BlockedReason)
@@ -312,6 +314,77 @@ func TestRunCommittedSyncPhaseDoesNotBlameADivergenceForAnUnrelatedPause(t *test
 	}
 	if git.rebaseAbortCount != 1 {
 		t.Errorf("rebaseAbortCount = %d, want 1: a pause is aborted whatever caused it", git.rebaseAbortCount)
+	}
+
+	// The status file only keeps the most recent cycle, so a suppressed cycle
+	// that re-derived its own reason would be the only thing the user ever
+	// reads — and it would send them after a divergence that isn't the problem.
+	suppressed, _, _ := runCommittedSyncPhase(git, committedSyncRepo(), guard, logger)
+	if suppressed.BlockedReason != "" || suppressed.Err == nil || !strings.Contains(suppressed.Err.Error(), "gpg failed to sign the data") {
+		t.Errorf("suppressed cycle = reason:%q err:%v, want the original failure repeated", suppressed.BlockedReason, suppressed.Err)
+	}
+}
+
+// TestRunCommittedSyncPhaseRetriesAFixableFailure covers the failure a guard
+// must not make permanent: nothing about the divergence changes when a signing
+// key is unlocked or a hook is fixed, so a guard that only released on new
+// commits would keep the repository stopped long after the cause was gone.
+func TestRunCommittedSyncPhaseRetriesAFixableFailure(t *testing.T) {
+	git := conflictingRebaseFakeGit()
+	git.rebasePauseErr = errors.New("gpg failed to sign the data")
+	git.conflicted = nil
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	guard := &replayGuard{}
+
+	runCommittedSyncPhase(git, committedSyncRepo(), guard, logger)
+	guard.retryTransientFailure()
+	git.rebasePauseErr = nil // the key is available now
+	result, _, needPush := runCommittedSyncPhase(git, committedSyncRepo(), guard, logger)
+
+	if result.Err != nil || !needPush {
+		t.Errorf("retried result = err:%v needPush:%v, want a completed replay", result.Err, needPush)
+	}
+	if git.rebaseCount != 2 {
+		t.Errorf("rebaseCount = %d, want 2", git.rebaseCount)
+	}
+}
+
+// TestRunCommittedSyncPhaseKeepsAConflictGuarded is the other side of that
+// release: a conflict stands until someone resolves it, and retrying one on
+// every periodic cycle would rewrite and restore the working tree forever.
+func TestRunCommittedSyncPhaseKeepsAConflictGuarded(t *testing.T) {
+	git := conflictingRebaseFakeGit()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	guard := &replayGuard{}
+
+	runCommittedSyncPhase(git, committedSyncRepo(), guard, logger)
+	guard.retryTransientFailure()
+	runCommittedSyncPhase(git, committedSyncRepo(), guard, logger)
+
+	if git.rebaseCount != 1 {
+		t.Errorf("rebaseCount = %d, want 1: a conflict is not retried on a timer", git.rebaseCount)
+	}
+}
+
+// TestRunCommittedSyncPhaseReportsAnOperationInProgress keeps gitloop from
+// blaming a user's edits for its own refusal to touch someone else's merge or
+// rebase — which leaves the working tree dirty by its very nature.
+func TestRunCommittedSyncPhaseReportsAnOperationInProgress(t *testing.T) {
+	git := &committedSyncFakeGit{
+		fakeGit:   &fakeGit{dirty: true},
+		ahead:     1,
+		behind:    1,
+		rebaseErr: gitcmd.ErrOperationInProgress,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	result, _, needPush := runCommittedSyncPhase(git, committedSyncRepo(), &replayGuard{}, logger)
+
+	if result.BlockedReason != BlockedOperation {
+		t.Errorf("BlockedReason = %q, want %q", result.BlockedReason, BlockedOperation)
+	}
+	if needPush || git.rebaseAbortCount != 0 {
+		t.Errorf("phase touched the other operation: needPush=%v aborts=%d", needPush, git.rebaseAbortCount)
 	}
 }
 
@@ -419,7 +492,11 @@ func (f *replayLoopFakeGit) RebaseAbort() error {
 
 func (f *replayLoopFakeGit) touchWorkingTree() {
 	f.writes++
-	os.WriteFile(filepath.Join(f.dir, "a.md"), []byte(fmt.Sprintf("replay %d\n", f.writes)), 0o644)
+	// A write that silently failed would leave the test passing for the wrong
+	// reason: no file event, so nothing to schedule the retry it guards against.
+	if err := os.WriteFile(filepath.Join(f.dir, "a.md"), []byte(fmt.Sprintf("replay %d\n", f.writes)), 0o644); err != nil {
+		panic(err)
+	}
 }
 
 // TestRunRepoLoopDoesNotRerunAFailedReplay is the loop-level half of the replay
