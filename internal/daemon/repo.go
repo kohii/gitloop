@@ -133,6 +133,32 @@ func runIntegratePhase(git GitClient, repo config.Repository, hostname string, l
 	return
 }
 
+// replayGuard remembers the one divergence whose replay already failed, so it
+// is not attempted again until something about it changes. It is per-
+// repository loop state, owned by runRepoLoop.
+//
+// Retrying is not merely wasteful, it does not terminate: a rebase rewrites the
+// working tree and so does the abort that undoes it, and those writes are the
+// file events that schedule the next cycle. Without this guard, a single
+// conflicting divergence has the daemon replaying and aborting the same rebase
+// every settle window — fetching the remote each time — until a human
+// intervenes.
+type replayGuard struct {
+	local    string
+	upstream string
+}
+
+// blocks reports whether this is the same divergence — both sides still at the
+// commits they were at — whose replay already failed. Either side moving means
+// the situation is new and worth another attempt.
+func (g *replayGuard) blocks(local, upstream string) bool {
+	return g.local != "" && g.local == local && g.upstream == upstream
+}
+
+func (g *replayGuard) remember(local, upstream string) {
+	g.local, g.upstream = local, upstream
+}
+
 // runCommittedSyncPhase transports only commits that already exist. It never
 // stages or creates a commit; a divergence is integrated by replaying the
 // local commits onto upstream, never by authoring a merge commit. A push is
@@ -142,7 +168,7 @@ func runIntegratePhase(git GitClient, repo config.Repository, hostname string, l
 // The caller holds the configured save lock. With save-lock coordination
 // disabled, git's own overwrite checks remain the guard, but external
 // writers have no advisory-lock handshake with the daemon.
-func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.Logger) (result cycleResult, branch string, needPush bool) {
+func runCommittedSyncPhase(git GitClient, repo config.Repository, guard *replayGuard, logger *slog.Logger) (result cycleResult, branch string, needPush bool) {
 	var err error
 	branch, err = checkedOutBranch(git, repo.Branch)
 	if err != nil {
@@ -157,17 +183,18 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 		return
 	}
 	state := statemachine.Classify(ahead, behind)
-	result.Action = statemachine.CommittedSyncActionFor(state)
-	logger.Info("classified committed-sync state", "state", state.String(), "ahead", ahead, "behind", behind)
+	action := statemachine.CommittedSyncActionFor(state)
+	result.Action = action
+	logger.Info("classified committed-sync state", "state", state.String(), "action", action.String(), "ahead", ahead, "behind", behind)
 
-	switch state {
-	case statemachine.Equal:
+	switch action {
+	case statemachine.NoOp:
 		// A dirty tree is fine when no remote commit needs to be checked out.
 
-	case statemachine.Ahead:
+	case statemachine.Push:
 		needPush = true
 
-	case statemachine.Behind:
+	case statemachine.FastForwardMerge:
 		// Ask git instead of pre-screening the working tree. `git merge
 		// --ff-only` refuses — before touching a single file — exactly when
 		// checking out the incoming tree would overwrite modified or
@@ -186,44 +213,63 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 			return
 		}
 
-	case statemachine.Diverged:
-		// Replaying the local commits is what keeps a divergence from
-		// parking the repository until someone notices: two machines
-		// committing to the same branch is the normal way a shared checkout
-		// diverges, and neither side's commits need a human to reconcile
-		// them. A rebase — rather than the merge the auto-commit workflow
-		// runs — is what committed-sync's contract allows, since it moves
-		// the user's own commits instead of authoring one of gitloop's. The
-		// rewrite is safe because Ahead commits are by definition unpushed.
-		conflict, err := git.Rebase(upstream)
-		if err != nil {
-			// A rebase, unlike a fast-forward, refuses any uncommitted
-			// change rather than only the ones in its way — so this is the
-			// refusal to expect on a shared checkout, labeled the same way.
-			if refusedOverUncommittedWork(git) {
-				result.BlockedReason = BlockedDirtyTree
-				result.Err = fmt.Errorf("postponing rebase: %w", err)
-			} else {
-				result.Err = fmt.Errorf("rebase: %w", err)
-			}
-			return
-		}
-		if conflict {
-			// Leaving the rebase paused would block every later cycle at
-			// PreCheck and hand the user a half-applied branch to reason
-			// about. Abort restores the pre-rebase state exactly, so the
-			// divergence is reported the way it was before gitloop tried.
-			if abortErr := git.RebaseAbort(); abortErr != nil {
-				result.Err = fmt.Errorf("rebase onto %s conflicted and could not be aborted: %w", upstream, abortErr)
-				return
-			}
-			result.BlockedReason = BlockedDiverged
-			result.Err = fmt.Errorf("replaying local commits onto %s stopped on a conflict; manual merge required", upstream)
-			return
-		}
-		needPush = true
+	case statemachine.RebaseThenPush:
+		result.BlockedReason, needPush, result.Err = replayDivergence(git, branch, upstream, guard, logger)
 	}
 	return
+}
+
+// replayDivergence integrates a divergence the way committed-sync's contract
+// allows: the local commits are replayed onto upstream rather than joined to it
+// by a merge commit gitloop wrote itself. Two machines committing to the same
+// branch is the ordinary way a shared checkout diverges, and neither side's
+// commits need a human to reconcile them. Rewriting them is safe because they
+// are unpushed — that is what Ahead means.
+func replayDivergence(git GitClient, branch, upstream string, guard *replayGuard, logger *slog.Logger) (blockedReason string, needPush bool, err error) {
+	localHead, err := git.RevParse(branch)
+	if err != nil {
+		return "", false, fmt.Errorf("resolving %s: %w", branch, err)
+	}
+	upstreamHead, err := git.RevParse(upstream)
+	if err != nil {
+		return "", false, fmt.Errorf("resolving %s: %w", upstream, err)
+	}
+	if guard.blocks(localHead, upstreamHead) {
+		return BlockedDiverged, false, fmt.Errorf("replaying local commits onto %s already failed and neither side has moved since; manual merge required", upstream)
+	}
+
+	paused, err := git.Rebase(upstream)
+	if paused {
+		guard.remember(localHead, upstreamHead)
+		// A conflict is the divergence the user has to merge by hand; a
+		// failing commit hook or an unavailable signing key pauses a rebase
+		// identically and needs a different fix entirely, so the blocked
+		// status is only claimed when a conflicted path is actually there.
+		conflicted, listErr := git.ConflictedFiles()
+		if listErr != nil {
+			logger.Warn("could not list conflicted paths for a paused rebase", "error", listErr)
+		}
+		if len(conflicted) > 0 {
+			blockedReason = BlockedDiverged
+		}
+		// Leaving the rebase paused would block every later cycle at PreCheck
+		// and hand the user a half-applied branch to reason about. Abort puts
+		// the branch and working tree back exactly as they were.
+		if abortErr := git.RebaseAbort(); abortErr != nil {
+			return "", false, fmt.Errorf("replaying local commits onto %s stopped and could not be aborted: %w", upstream, abortErr)
+		}
+		return blockedReason, false, fmt.Errorf("replaying local commits onto %s stopped: %w", upstream, err)
+	}
+	if err != nil {
+		// A rebase, unlike a fast-forward, refuses over any uncommitted change
+		// rather than only the ones in its way — so this is the refusal to
+		// expect on a shared checkout, labeled the same way.
+		if refusedOverUncommittedWork(git) {
+			return BlockedDirtyTree, false, fmt.Errorf("postponing rebase: %w", err)
+		}
+		return "", false, fmt.Errorf("rebase: %w", err)
+	}
+	return "", true, nil
 }
 
 // refusedOverUncommittedWork labels a refused fast-forward or rebase without

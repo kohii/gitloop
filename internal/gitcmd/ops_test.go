@@ -2,6 +2,7 @@ package gitcmd
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -398,12 +399,17 @@ func TestRebaseReportsConflictAndAbortRestoresTheBranch(t *testing.T) {
 	r := divergedRepo(t, dir, "a.md", "local\n", "upstream\n")
 	before := strings.TrimSpace(runOut(t, dir, "rev-parse", "main"))
 
-	conflict, err := r.Rebase("upstream")
-	if err != nil {
-		t.Fatalf("Rebase: %v", err)
+	paused, err := r.Rebase("upstream")
+	if !paused {
+		t.Fatalf("Rebase() paused = false (err: %v), want true", err)
 	}
-	if !conflict {
-		t.Fatal("Rebase() conflict = false, want true")
+	// The error comes back with the pause so callers can tell a conflict apart
+	// from the other things that stop a rebase.
+	if err == nil {
+		t.Error("Rebase() err = nil on a pause, want the git error that stopped it")
+	}
+	if files, filesErr := r.ConflictedFiles(); filesErr != nil || len(files) != 1 || files[0] != "a.md" {
+		t.Errorf("ConflictedFiles = %v, err=%v, want [a.md]", files, filesErr)
 	}
 
 	if err := r.RebaseAbort(); err != nil {
@@ -431,12 +437,12 @@ func TestRebaseRefusesUncommittedChanges(t *testing.T) {
 	r := divergedRepo(t, dir, "a.md", "local\n", "upstream\n")
 	writeFile(t, dir, "b.md", "uncommitted\n")
 
-	conflict, err := r.Rebase("upstream")
+	paused, err := r.Rebase("upstream")
 	if err == nil {
 		t.Fatal("Rebase() = nil, want a refusal over uncommitted changes")
 	}
-	if conflict {
-		t.Error("Rebase() conflict = true, want false: the rebase never started")
+	if paused {
+		t.Error("Rebase() paused = true, want false: the rebase never started")
 	}
 	if got := readFile(t, dir, "b.md"); got != "uncommitted\n" {
 		t.Errorf("b.md = %q, want the uncommitted content left alone", got)
@@ -479,18 +485,14 @@ func TestPausedOperationsAreDetectedInALinkedWorktree(t *testing.T) {
 	runIn(t, dir, "worktree", "add", "-q", "-b", "linked-main", linked, "main")
 	r := New(linked)
 
-	conflict, err := r.Rebase("upstream")
-	if err != nil {
-		t.Fatalf("Rebase in a linked worktree: %v", err)
-	}
-	if !conflict {
-		t.Fatal("Rebase() conflict = false, want true")
+	if paused, err := r.Rebase("upstream"); !paused {
+		t.Fatalf("Rebase() paused = false (err: %v), want true", err)
 	}
 	if err := r.RebaseAbort(); err != nil {
 		t.Fatalf("RebaseAbort: %v", err)
 	}
 
-	conflict, err = r.Merge("upstream")
+	conflict, err := r.Merge("upstream")
 	if err != nil {
 		t.Fatalf("Merge in a linked worktree: %v", err)
 	}
@@ -499,6 +501,49 @@ func TestPausedOperationsAreDetectedInALinkedWorktree(t *testing.T) {
 	}
 	if err := r.MergeAbort(); err != nil {
 		t.Fatalf("MergeAbort: %v", err)
+	}
+}
+
+// TestRebaseAndMergeRefuseAnOperationAlreadyInProgress is what keeps gitloop
+// from destroying someone else's work. Git declines to start a second merge or
+// rebase and leaves the first one's state directory standing, which is exactly
+// what "our own operation stopped on a conflict" looks like — and the recovery
+// for that is to abort or commit it. Being told to resolve a divergence by hand
+// is precisely when a user starts a rebase of their own, so this is a race the
+// daemon runs into rather than a theoretical one.
+func TestRebaseAndMergeRefuseAnOperationAlreadyInProgress(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := divergedRepo(t, dir, "a.md", "local\n", "upstream\n")
+	if paused, err := r.Rebase("upstream"); !paused {
+		t.Fatalf("Rebase() paused = false (err: %v), want a paused rebase to set the scene", err)
+	}
+	head := strings.TrimSpace(runOut(t, dir, "rev-parse", "HEAD"))
+
+	if paused, err := r.Rebase("upstream"); paused || !errors.Is(err, ErrOperationInProgress) {
+		t.Errorf("Rebase() with one in progress = paused:%v err:%v, want ErrOperationInProgress", paused, err)
+	}
+	if got := strings.TrimSpace(runOut(t, dir, "rev-parse", "HEAD")); got != head {
+		t.Errorf("HEAD = %s, want the in-progress rebase left at %s", got, head)
+	}
+	if !r.hasRebaseInProgress() {
+		t.Error("the in-progress rebase was cleared")
+	}
+	if err := r.RebaseAbort(); err != nil {
+		t.Fatalf("RebaseAbort: %v", err)
+	}
+
+	// The same for a paused merge, where the stakes are higher still: the
+	// caller's recovery is to resolve and commit it.
+	if conflict, err := r.Merge("upstream"); !conflict {
+		t.Fatalf("Merge() conflict = false (err: %v), want a paused merge to set the scene", err)
+	}
+	if conflict, err := r.Merge("upstream"); conflict || !errors.Is(err, ErrOperationInProgress) {
+		t.Errorf("Merge() with one in progress = conflict:%v err:%v, want ErrOperationInProgress", conflict, err)
+	}
+	if !r.hasMergeInProgress() {
+		t.Error("the in-progress merge was cleared")
 	}
 }
 

@@ -143,8 +143,11 @@ PATH                PHASE  LAST_COMMIT                LAST_PUSH                 
 /Users/you/journal  -      -                          -                          not yet synced  -                    -
 ```
 
-The `BLOCKED` column reports why a committed-sync repository is waiting,
-such as `dirty-working-tree` or `diverged-history`.
+The `BLOCKED` column reports why a committed-sync repository is waiting:
+`dirty-working-tree`, `diverged-history`, or `operation-in-progress`. The last
+one means the checkout has a merge or rebase part-way through — gitloop stays
+out of it entirely, including one of its own left behind by a daemon that was
+killed mid-replay, so syncing resumes once you finish or `--abort` it.
 
 ## Sync behavior
 
@@ -169,13 +172,17 @@ runs one cycle per repository:
    | 0     | >0     | fast-forward merge  |
    | >0    | >0     | merge, then push    |
 
-See `docs/design.md` for the full state table and the conflict-resolution
-flow diagram.
+Steps 3 and 4 differ under `committed-sync`, which never commits and replays a
+divergence instead of merging it — see "Committed-sync repositories" below.
+`docs/design.md` has the full state table and the conflict-resolution flow
+diagram.
 
-gitloop never runs `git reset --hard` or `git push --force`: every history
-change it makes is an ordinary commit (an auto-commit, a merge commit, or a
-merge commit carrying conflict backups), so nothing is ever discarded except
-into `git reflog`'s normal safety net.
+gitloop never runs `git reset --hard` or `git push --force`, and never
+discards anything outside `git reflog`'s normal safety net. Under the
+auto-commit workflows every history change it makes is an ordinary commit (an
+auto-commit, a merge commit, or a merge commit carrying conflict backups);
+`committed-sync` additionally rebases unpushed local commits onto upstream to
+resolve a divergence.
 
 ### Commit-only repositories
 
@@ -240,7 +247,14 @@ else can be built on. The same edit committed on two machines is dropped by
 Git's own patch-id check rather than turning into a conflict. A rebase needs a
 clean working tree, so uncommitted changes defer it; a replay that hits a real
 conflict is aborted, restoring the branch exactly as it was, and left for a
-human.
+human. Once a replay has failed, it is not attempted again until one side
+commits something new — the same divergence would only fail the same way.
+
+Two consequences of replaying rather than merging are worth knowing about. An
+unpushed merge commit of your own is flattened away, since a plain rebase
+replays commits individually. And the replayed commits are re-signed and
+re-dated, so under `commit.gpgsign` the signing key has to be available to the
+daemon or the replay stops (reported with the Git error, not as a conflict).
 
 One thing this does not protect: a file you keep locally but `.gitignore` is
 overwritten without warning if the remote starts tracking that path, because

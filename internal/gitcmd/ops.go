@@ -2,6 +2,7 @@ package gitcmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -48,6 +49,16 @@ func (r *Runner) RemoteNames() ([]string, error) {
 // CurrentBranch returns the checked-out branch name.
 func (r *Runner) CurrentBranch() (string, error) {
 	res, err := r.run("rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(res.Stdout), nil
+}
+
+// RevParse resolves a ref to the commit ID it points at
+// (`git rev-parse <ref>`).
+func (r *Runner) RevParse(ref string) (string, error) {
+	res, err := r.run("rev-parse", ref)
 	if err != nil {
 		return "", err
 	}
@@ -101,6 +112,12 @@ func (r *Runner) MergeFF(upstream string) error {
 	return err
 }
 
+// ErrOperationInProgress is returned by Merge and Rebase when the repository
+// is already in the middle of one. Callers recover from their own paused
+// operation by aborting it; doing that to someone else's would destroy work in
+// progress, so the two are never allowed to look alike.
+var ErrOperationInProgress = errors.New("gitcmd: a merge or rebase is already in progress")
+
 // Merge merges upstream into the current branch
 // (`git merge --no-ff --no-edit <upstream>`), creating a merge commit with
 // git's default message. Callers only use Merge once local and upstream
@@ -111,7 +128,16 @@ func (r *Runner) MergeFF(upstream string) error {
 // on a conflict, Merge returns (true, nil) rather than an error: a paused
 // merge is an expected outcome the caller must handle, not a failure of the
 // git invocation.
+//
+// A merge already in progress is refused with ErrOperationInProgress. Git
+// declines to start a second one and leaves the first one's MERGE_HEAD
+// standing, which the check below cannot tell apart from "our merge stopped on
+// a conflict" — and the caller's answer to that is to resolve and commit it,
+// which would be committing a merge someone else is still working through.
 func (r *Runner) Merge(upstream string) (conflict bool, err error) {
+	if r.hasMergeInProgress() {
+		return false, ErrOperationInProgress
+	}
 	_, runErr := r.run("merge", "--no-ff", "--no-edit", upstream)
 	if runErr == nil {
 		return false, nil
@@ -137,24 +163,34 @@ func (r *Runner) MergeAbort() error {
 // what makes the same edit committed on two machines converge instead of
 // conflicting.
 //
-// If the rebase stops on a conflict, Rebase returns (true, nil) rather than an
-// error, mirroring Merge: a paused rebase is an outcome the caller must decide
-// about, not a failed invocation. Every other non-zero exit — a dirty working
-// tree being the one to expect — is returned as an error with the rebase not
-// started.
+// A rebase that stops partway returns paused=true *and* the git error that
+// stopped it. A conflict is the reason to expect, but a failing commit hook or
+// an unavailable signing key pauses a rebase identically, and a caller that
+// only learned "paused" would report every one of them as a divergence a human
+// must merge. Every other non-zero exit — a dirty working tree being the one to
+// expect — comes back with paused=false and the rebase not started.
+//
+// A rebase already in progress is refused with ErrOperationInProgress, for the
+// same reason Merge refuses one: git leaves the existing state directory in
+// place, and aborting it would throw away a replay someone else is partway
+// through resolving. That is not a remote possibility here — gitloop reports a
+// conflicted replay by telling the user to resolve the divergence by hand.
 //
 // rebase.autoStash is overridden for the same reason MergeFF suppresses
 // merge.autoStash: under a user's `rebase.autostash = true`, git stashes the
 // uncommitted work, rebases, and can fail to reapply it, leaving conflict
 // markers in the working tree and the user's work in a stash entry. Refusing
 // outright gives the caller a dirty tree to report instead.
-func (r *Runner) Rebase(upstream string) (conflict bool, err error) {
+func (r *Runner) Rebase(upstream string) (paused bool, err error) {
+	if r.hasRebaseInProgress() {
+		return false, ErrOperationInProgress
+	}
 	_, runErr := r.run("-c", "rebase.autoStash=false", "rebase", upstream)
 	if runErr == nil {
 		return false, nil
 	}
 	if r.hasRebaseInProgress() {
-		return true, nil
+		return true, runErr
 	}
 	return false, runErr
 }

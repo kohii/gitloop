@@ -85,11 +85,28 @@ against.
 The pre-conditions are still git's to enforce. A rebase refuses to start over
 *any* uncommitted change (unlike `merge --ff-only`, which refuses only the
 paths in its way), so a dirty tree defers the replay with
-`blocked_reason: dirty-working-tree`. A replay that stops on a real conflict is
-aborted — restoring the branch and working tree exactly — and reported as
-`diverged-history`, the state it was in before gitloop tried. Leaving the
+`blocked_reason: dirty-working-tree`. A replay that stops is aborted —
+restoring the branch and working tree exactly — and reported. Leaving the
 rebase paused instead would trip `PreCheck` on every later cycle and hand the
-user a half-applied branch to reason about.
+user a half-applied branch to reason about. Only a stop with conflicted paths
+in the index earns `diverged-history`: a failing commit hook or an unavailable
+signing key pauses a rebase identically, and telling the user to merge by hand
+would send them after the wrong problem, so those keep the git error alone.
+
+**A failed replay is not retried until something changes** (`replayGuard`).
+This is not an optimization: a rebase rewrites the working tree and so does
+the abort that undoes it, and those writes are the file events that schedule
+the next cycle. A conflicting divergence would otherwise replay every settle
+window — fetching the remote each time — for as long as it stood. The guard
+remembers the (local, upstream) commit pair it failed on; either side moving
+is a new situation and gets a fresh attempt.
+
+What a plain rebase does not preserve is a local merge commit: it replays
+commits individually, so an unpushed merge of the user's own is flattened.
+`--rebase-merges` would keep the shape at the cost of a much larger surface
+(a generated todo list, and its own failure modes) for a case that barely
+arises in a repository whose commits are ordinary edits. The flattening is
+documented in the README instead.
 
 ### Remote command lifetime
 
@@ -178,9 +195,25 @@ Before any of this runs, `statemachine.PreCheck` stats `.git/rebase-merge`,
 `.git/rebase-apply`, and `.git/MERGE_HEAD` (following the `gitdir:`
 indirection for worktrees). If any exist, the cycle is skipped entirely —
 gitloop never touches a repository that a human (or another tool) is in the
-middle of operating on. gitloop never *leaves* one of those markers behind
-either: the only rebase it runs is committed-sync's divergence replay, which
-is aborted in the same cycle if it stops on a conflict.
+middle of operating on.
+
+PreCheck is not the only guard, because it runs before the fetch and the save
+lock — several seconds before the merge or rebase it is guarding. A human who
+starts a rebase inside that window (which is exactly what a
+`diverged-history` status tells them to do) would otherwise have it aborted
+by gitloop, since git leaves the existing state directory standing and
+declines to start a second operation, which looks identical to "our own
+operation stopped on a conflict". `gitcmd.Merge` and `gitcmd.Rebase` therefore
+re-check immediately before running and refuse with
+`gitcmd.ErrOperationInProgress`.
+
+gitloop does not normally leave those markers behind: the only rebase it runs
+is committed-sync's divergence replay, and a replay that stops is aborted in
+the same cycle. The two ways one can survive are a failed `--abort` (reported
+as an error) and the daemon being killed mid-replay. Either leaves PreCheck
+skipping every cycle with `operation-in-progress` until a human runs
+`git rebase --abort`; there is deliberately no self-recovery, since a rebase
+state directory is not gitloop's to interpret after the fact.
 
 Reusing the same cycle (guard -> fetch -> commit-if-dirty -> classify -> act)
 for all three triggers — settle timer, max-wait timer, and the periodic

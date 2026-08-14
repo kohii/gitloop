@@ -37,6 +37,7 @@ func (f *fakeConflictGit) Commit(msg string) error {
 func (f *fakeConflictGit) RemoteNames() ([]string, error)      { return []string{"origin"}, nil }
 func (f *fakeConflictGit) Fetch(context.Context, string) error { return nil }
 func (f *fakeConflictGit) CurrentBranch() (string, error)      { return "main", nil }
+func (f *fakeConflictGit) RevParse(ref string) (string, error) { return "commit-of-" + ref, nil }
 func (f *fakeConflictGit) RevListLeftRightCount(string, string) (int, int, error) {
 	return 0, 0, nil
 }

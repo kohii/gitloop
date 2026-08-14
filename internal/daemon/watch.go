@@ -54,6 +54,10 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 	fetchTicker := time.NewTicker(repo.FetchInterval)
 	defer fetchTicker.Stop()
 
+	// Carried across cycles: a divergence whose replay failed must not be
+	// retried on the file events that the failed attempt itself produced.
+	var replay replayGuard
+
 	runCycle := func(trigger string) {
 		logger.Info("running sync cycle", "trigger", trigger)
 
@@ -134,7 +138,7 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		if repo.AutoCommits() {
 			result = runCommitPhase(git, hostname, logger)
 		} else {
-			result, branch, needPush = runCommittedSyncPhase(git, repo, logger)
+			result, branch, needPush = runCommittedSyncPhase(git, repo, &replay, logger)
 		}
 		if repo.AutoCommits() && syncsRemote && result.Err == nil && fetchErr == nil {
 			integrateResult, b, n := runIntegratePhase(git, repo, hostname, logger, recorder)
