@@ -134,15 +134,14 @@ func runIntegratePhase(git GitClient, repo config.Repository, hostname string, l
 }
 
 // replayGuard remembers the one divergence whose replay already failed, so it
-// is not attempted again until something about it changes. It is per-
-// repository loop state, owned by runRepoLoop.
+// is not attempted again until something about it changes. It is per-repository
+// loop state, owned by runRepoLoop.
 //
 // Retrying is not merely wasteful, it does not terminate: a rebase rewrites the
 // working tree and so does the abort that undoes it, and those writes are the
-// file events that schedule the next cycle. Without this guard, a single
-// conflicting divergence has the daemon replaying and aborting the same rebase
-// every settle window — fetching the remote each time — until a human
-// intervenes.
+// file events that schedule the next cycle. Without this guard, one conflicting
+// divergence has the daemon replaying and aborting the same rebase every settle
+// window — fetching the remote each time — until a human intervenes.
 type replayGuard struct {
 	local    string
 	upstream string

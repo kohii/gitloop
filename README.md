@@ -231,7 +231,7 @@ Each cycle fetches the remote and classifies the checked-out branch:
 | dirty in a file the incoming commits rewrite | behind | defer and report `dirty-working-tree` |
 | clean | diverged | replay the local commits onto upstream, then push |
 | dirty | diverged | defer and report `dirty-working-tree` |
-| clean | diverged, and the replay conflicts | abort it and report `diverged-history` |
+| clean | diverged, replay conflicts | abort the replay and report `diverged-history` |
 
 Fetching and pushing existing commits are safe while files are being edited,
 and so is a fast-forward that rewrites none of them. gitloop just runs
@@ -239,22 +239,24 @@ and so is a fast-forward that rewrites none of them. gitloop just runs
 when the update would overwrite modified or untracked content, so editing one
 file doesn't hold the whole repository behind upstream.
 
-A divergence — two machines each committing to the same branch — is resolved
-with `git rebase`, which replays your local commits on top of upstream. That
-keeps every commit in the repository one a person wrote, since gitloop
-authors no merge commit, and the commits it rewrites are unpushed ones nothing
-else can be built on. The same edit committed on two machines is dropped by
-Git's own patch-id check rather than turning into a conflict. A rebase needs a
-clean working tree, so uncommitted changes defer it; a replay that hits a real
-conflict is aborted, restoring the branch exactly as it was, and left for a
-human. Once a replay has failed, it is not attempted again until one side
-commits something new — the same divergence would only fail the same way.
+A divergence — two machines each committing to the same branch — is replayed
+with `git rebase`, putting your local commits on top of upstream. Every commit
+in the repository stays one a person wrote, since gitloop authors no merge
+commit, and the commits it rewrites are unpushed ones nothing else can be built
+on. The same edit committed on two machines is dropped by Git's patch-id check
+instead of conflicting. A rebase needs a clean working tree, so uncommitted
+changes defer it, and a replay that hits a real conflict is aborted — leaving
+the branch exactly as it was — and left to you. A failed replay is not retried
+until one side commits something new; the same divergence would only fail the
+same way.
 
-Two consequences of replaying rather than merging are worth knowing about. An
-unpushed merge commit of your own is flattened away, since a plain rebase
-replays commits individually. And the replayed commits are re-signed and
-re-dated, so under `commit.gpgsign` the signing key has to be available to the
-daemon or the replay stops (reported with the Git error, not as a conflict).
+Replaying rather than merging has two consequences worth knowing:
+
+- An unpushed merge commit of your own is flattened, because a plain rebase
+  replays commits individually.
+- Replayed commits are re-committed, so under `commit.gpgsign` the signing key
+  has to be reachable by the daemon or the replay stops. That is reported with
+  the Git error rather than as a divergence.
 
 One thing this does not protect: a file you keep locally but `.gitignore` is
 overwritten without warning if the remote starts tracking that path, because

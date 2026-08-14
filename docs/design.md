@@ -60,53 +60,11 @@ nested `workflow` tag. The three workflow contracts are:
   staging or creating a commit.
 
 `committed-sync` fetches on every cycle, pushes an ahead branch even when the
-working tree is dirty, fast-forwards whenever git is willing to, and resolves a
-divergence by replaying the local commits onto upstream. It never creates a
-commit — including a merge commit — so every commit it transports is one a
-person wrote.
-
-**Why a rebase is the divergence action here, when the auto-commit workflow
-merges.** A merge would satisfy "don't rewrite history" but violate the
-contract that matters more for this workflow: the merge commit would be one
-gitloop authored. A rebase inverts that trade — it writes no commit of its
-own, and what it rewrites are the local branch's Ahead commits, which are by
-definition unpushed, so nothing outside this checkout can be built on the
-versions being replaced. Git's patch-id check also drops commits already
-applied upstream, which is what makes the same edit committed on two machines
-converge instead of conflicting on every cycle.
-
-Blocking instead was the original behavior and turned out to be the wrong
-default: a shared dotfiles checkout diverges as a matter of course whenever two
-machines commit between fetches, and neither side's commits need a human to
-reconcile them. A repository that stops syncing until someone reads
-`gitloop status` is a worse failure than the one the block was guarding
-against.
-
-The pre-conditions are still git's to enforce. A rebase refuses to start over
-*any* uncommitted change (unlike `merge --ff-only`, which refuses only the
-paths in its way), so a dirty tree defers the replay with
-`blocked_reason: dirty-working-tree`. A replay that stops is aborted —
-restoring the branch and working tree exactly — and reported. Leaving the
-rebase paused instead would trip `PreCheck` on every later cycle and hand the
-user a half-applied branch to reason about. Only a stop with conflicted paths
-in the index earns `diverged-history`: a failing commit hook or an unavailable
-signing key pauses a rebase identically, and telling the user to merge by hand
-would send them after the wrong problem, so those keep the git error alone.
-
-**A failed replay is not retried until something changes** (`replayGuard`).
-This is not an optimization: a rebase rewrites the working tree and so does
-the abort that undoes it, and those writes are the file events that schedule
-the next cycle. A conflicting divergence would otherwise replay every settle
-window — fetching the remote each time — for as long as it stood. The guard
-remembers the (local, upstream) commit pair it failed on; either side moving
-is a new situation and gets a fresh attempt.
-
-What a plain rebase does not preserve is a local merge commit: it replays
-commits individually, so an unpushed merge of the user's own is flattened.
-`--rebase-merges` would keep the shape at the cost of a much larger surface
-(a generated todo list, and its own failure modes) for a case that barely
-arises in a repository whose commits are ordinary edits. The flattening is
-documented in the README instead.
+working tree is dirty, fast-forwards whenever git is willing to, and replays
+the local commits onto upstream when the two have diverged. It never creates a
+commit of its own, merge commits included, so every commit it transports is one
+a person wrote. See "Why a committed-sync divergence is replayed, not merged"
+below.
 
 ### Remote command lifetime
 
@@ -178,6 +136,45 @@ report them, so the situation is invisible from here. This predates the
 change above — a clean-tree rule doesn't help, since the overwrite happens on
 whichever cycle finds the tree clean.
 
+### Why a committed-sync divergence is replayed, not merged
+
+A merge would preserve history, but the merge commit would be one gitloop
+wrote — the single thing this workflow promises not to do. A rebase inverts the
+trade: it writes no commit of its own, and what it rewrites are the branch's
+Ahead commits, unpushed by definition, so nothing outside the checkout can be
+built on the versions it replaces. Git's patch-id check drops commits already
+applied upstream, so the same edit committed on two machines converges instead
+of conflicting on every cycle.
+
+Blocking, the original behavior, was the wrong default. A shared checkout
+diverges whenever two machines commit between fetches, and neither side's
+commits need a human to reconcile them; a repository that waits for someone to
+read `gitloop status` is the worse failure.
+
+Git enforces the pre-conditions, as it does for the fast-forward above:
+
+- **Uncommitted work.** A rebase refuses to start over *any* of it, where
+  `merge --ff-only` refuses only the paths in its way, so a dirty tree defers
+  the replay with `blocked_reason: dirty-working-tree`.
+- **A stopped replay is aborted in the same cycle**, restoring the branch and
+  working tree exactly. Leaving it paused would trip `PreCheck` on every later
+  cycle and hand the user a half-applied branch to reason about.
+- **Only a stop with conflicted paths earns `diverged-history`.** A failing
+  commit hook or an unavailable signing key pauses a rebase identically, and
+  telling the user to merge by hand would send them after the wrong problem.
+
+A failed replay is not retried until one side commits something new
+(`replayGuard`). This is not an optimization: the rebase rewrites the working
+tree and so does the abort that undoes it, and those writes are the file events
+that schedule the next cycle, so a conflicting divergence would replay every
+settle window — fetching the remote each time — for as long as it stood.
+
+A plain rebase replays commits individually, so an unpushed merge commit of the
+user's own is flattened. `--rebase-merges` would keep the shape at the cost of
+a generated todo list and its own failure modes, for a case that barely arises
+in a repository whose commits are ordinary edits; the flattening is documented
+in the README instead.
+
 ## Sync state table
 
 After `git fetch`, `git rev-list --left-right --count <branch>...<remote>/<branch>`
@@ -197,23 +194,19 @@ indirection for worktrees). If any exist, the cycle is skipped entirely —
 gitloop never touches a repository that a human (or another tool) is in the
 middle of operating on.
 
-PreCheck is not the only guard, because it runs before the fetch and the save
-lock — several seconds before the merge or rebase it is guarding. A human who
-starts a rebase inside that window (which is exactly what a
-`diverged-history` status tells them to do) would otherwise have it aborted
-by gitloop, since git leaves the existing state directory standing and
-declines to start a second operation, which looks identical to "our own
-operation stopped on a conflict". `gitcmd.Merge` and `gitcmd.Rebase` therefore
-re-check immediately before running and refuse with
-`gitcmd.ErrOperationInProgress`.
+PreCheck alone is not enough, because it runs before the fetch and the save
+lock — seconds before the operation it guards. Git leaves an existing state
+directory standing and declines to start a second merge or rebase, which is
+indistinguishable from "our own stopped on a conflict", so gitloop would abort
+a rebase a human began inside that window — precisely what a `diverged-history`
+status invites them to do. `gitcmd.Merge` and `gitcmd.Rebase` therefore
+re-check immediately before running and refuse with `ErrOperationInProgress`.
 
-gitloop does not normally leave those markers behind: the only rebase it runs
-is committed-sync's divergence replay, and a replay that stops is aborted in
-the same cycle. The two ways one can survive are a failed `--abort` (reported
-as an error) and the daemon being killed mid-replay. Either leaves PreCheck
-skipping every cycle with `operation-in-progress` until a human runs
-`git rebase --abort`; there is deliberately no self-recovery, since a rebase
-state directory is not gitloop's to interpret after the fact.
+gitloop leaves a marker of its own only two ways: an abort that fails (reported
+as an error), and a daemon killed mid-replay. Either has PreCheck skipping
+every cycle with `operation-in-progress` until a human runs
+`git rebase --abort`. There is no self-recovery, since a state directory is not
+gitloop's to interpret after the fact.
 
 Reusing the same cycle (guard -> fetch -> commit-if-dirty -> classify -> act)
 for all three triggers — settle timer, max-wait timer, and the periodic
@@ -247,16 +240,17 @@ that commits are human-created.
 
 ## Conflict flow
 
-This section is about the auto-commit workflow, where `Diverged` maps to
-`merge, then push`. It never uses `git rebase` or `git reset --hard`: a
-vault-app contract this daemon must respect forbids rewriting history under an
-auto-commit repository, and `reset --hard` in particular used to discard every
-local commit down to upstream on a conflict — including commits to files that
-had nothing to do with the conflict. A merge only ever touches the files it
-can't auto-resolve, so non-conflicting local commits are always preserved as
-part of the merge commit. (Committed-sync does rebase, and has no conflict
-policy at all: see "Workflow contracts" for why the trade lands the other way
-when every commit is human-authored.)
+This section covers the auto-commit workflow, where `Diverged` maps to
+`merge, then push`. (Committed-sync replays instead and has no conflict policy
+at all — see "Why a committed-sync divergence is replayed, not merged" for why
+the trade lands the other way when every commit is human-authored.)
+
+An auto-commit repository never sees `git rebase` or `git reset --hard`: a
+vault-app contract this daemon must respect forbids rewriting history there,
+and `reset --hard` in particular used to discard every local commit down to
+upstream on a conflict — including commits to files that had nothing to do with
+it. A merge only ever touches the files it can't auto-resolve, so
+non-conflicting local commits are always preserved as part of the merge commit.
 
 `git merge --no-ff --no-edit <upstream>` either fast-forwards (never
 actually reachable here, since Diverged means neither side is an ancestor

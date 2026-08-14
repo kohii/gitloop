@@ -165,19 +165,18 @@ func (r *Runner) MergeAbort() error {
 //
 // A rebase that stops partway returns paused=true *and* the git error that
 // stopped it. A conflict is the reason to expect, but a failing commit hook or
-// an unavailable signing key pauses a rebase identically, and a caller that
-// only learned "paused" would report every one of them as a divergence a human
-// must merge. Every other non-zero exit — a dirty working tree being the one to
+// an unavailable signing key pauses a rebase identically, and a caller told
+// only "paused" would report every one of them as a divergence a human must
+// merge. Any other non-zero exit — a dirty working tree being the one to
 // expect — comes back with paused=false and the rebase not started.
 //
-// A rebase already in progress is refused with ErrOperationInProgress, for the
-// same reason Merge refuses one: git leaves the existing state directory in
-// place, and aborting it would throw away a replay someone else is partway
-// through resolving. That is not a remote possibility here — gitloop reports a
-// conflicted replay by telling the user to resolve the divergence by hand.
+// A rebase already in progress is refused with ErrOperationInProgress, as Merge
+// refuses a merge: git leaves the existing state directory in place, so
+// aborting on the caller's behalf would throw away a replay someone else is
+// partway through.
 //
-// rebase.autoStash is overridden for the same reason MergeFF suppresses
-// merge.autoStash: under a user's `rebase.autostash = true`, git stashes the
+// rebase.autoStash is overridden for the reason MergeFF suppresses
+// merge.autoStash: under `rebase.autostash = true`, git stashes the
 // uncommitted work, rebases, and can fail to reapply it, leaving conflict
 // markers in the working tree and the user's work in a stash entry. Refusing
 // outright gives the caller a dirty tree to report instead.
