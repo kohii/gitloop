@@ -54,6 +54,10 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 	fetchTicker := time.NewTicker(repo.FetchInterval)
 	defer fetchTicker.Stop()
 
+	// Carried across cycles: a divergence whose replay failed must not be
+	// retried on the file events that the failed attempt itself produced.
+	var replay replayGuard
+
 	runCycle := func(trigger string) {
 		logger.Info("running sync cycle", "trigger", trigger)
 
@@ -134,7 +138,7 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		if repo.AutoCommits() {
 			result = runCommitPhase(git, hostname, logger)
 		} else {
-			result, branch, needPush = runCommittedSyncPhase(git, repo, logger)
+			result, branch, needPush = runCommittedSyncPhase(git, repo, &replay, logger)
 		}
 		if repo.AutoCommits() && syncsRemote && result.Err == nil && fetchErr == nil {
 			integrateResult, b, n := runIntegratePhase(git, repo, hostname, logger, recorder)
@@ -173,12 +177,15 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			}
 			if err != nil {
 				err = annotateRemoteError(err, repo.RemoteTimeout)
-				// Preserve the "why are we pushing" context — a push after a
-				// merge commit vs. a bare push of local-only commits are
+				// Preserve the "why are we pushing" context — a push after an
+				// integration vs. a bare push of local-only commits are
 				// meaningfully different failures at debug time.
-				if result.Action == statemachine.MergeThenPush {
+				switch result.Action {
+				case statemachine.MergeThenPush:
 					result.Err = fmt.Errorf("push after merge: %w", err)
-				} else {
+				case statemachine.RebaseThenPush:
+					result.Err = fmt.Errorf("push after rebase: %w", err)
+				default:
 					result.Err = fmt.Errorf("push: %w", err)
 				}
 			} else {
@@ -257,6 +264,13 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			// working tree, so reusing the same cycle here naturally gives
 			// us "fetch, and integrate if behind/diverged" without a
 			// separate code path.
+			//
+			// This is also the one trigger that may retry a replay that
+			// stopped over something fixable, such as a signing key that was
+			// locked at the time. It is rate-limited by the interval, where
+			// the file-event triggers above are not — and the failed replay's
+			// own writes are among those events.
+			replay.retryTransientFailure()
 			runCycle("fetch-interval")
 		}
 	}

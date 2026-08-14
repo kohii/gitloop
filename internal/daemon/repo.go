@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -25,17 +26,18 @@ type cycleResult struct {
 	// files in the working tree that still need attention.
 	Conflict bool
 	// BlockedReason is a stable status-facing reason for a deliberate
-	// committed-sync refusal, such as a dirty working tree behind upstream or
-	// divergent histories. It is intentionally separate from Err so callers
-	// can display a concise actionable status while retaining the full error.
+	// committed-sync refusal, such as a dirty working tree or a divergence
+	// that could not be replayed. It is intentionally separate from Err so
+	// callers can display a concise actionable status while retaining the
+	// full error.
 	BlockedReason string
 	Err           error
 }
 
 const (
-	BlockedDirtyBehind = "dirty-working-tree"
-	BlockedDiverged    = "diverged-history"
-	BlockedOperation   = "operation-in-progress"
+	BlockedDirtyTree = "dirty-working-tree"
+	BlockedDiverged  = "diverged-history"
+	BlockedOperation = "operation-in-progress"
 )
 
 // runPreCheckPhase runs the guard step that opens a sync cycle: is there a
@@ -128,19 +130,73 @@ func runIntegratePhase(git GitClient, repo config.Repository, hostname string, l
 			result.Conflict = backup
 		}
 		needPush = true
+
+	default:
+		result.Err = fmt.Errorf("auto-commit-sync has no handling for action %s", action)
 	}
 	return
 }
 
+// replayGuard remembers the one divergence whose replay already failed, so it
+// is not attempted again until something about it changes. It is per-repository
+// loop state, owned by runRepoLoop.
+//
+// Retrying is not merely wasteful, it does not terminate: a rebase rewrites the
+// working tree and so does the abort that undoes it, and those writes are the
+// file events that schedule the next cycle. Without this guard, one conflicting
+// divergence has the daemon replaying and aborting the same rebase every settle
+// window — fetching the remote each time — until a human intervenes.
+// Only a divergence needs guarding. A refused fast-forward or rebase is
+// declined by git before it writes anything, so nothing about it wakes the
+// watcher.
+type replayGuard struct {
+	local    string
+	upstream string
+	// reason and err are the failure itself, replayed verbatim on the cycles
+	// that are suppressed. Re-deriving a reason there would report every
+	// suppressed cycle as a divergence to merge by hand, including the ones
+	// that stopped over a locked signing key or a failing hook — and the
+	// status file only keeps the most recent cycle, so that is all a user
+	// would ever see.
+	reason string
+	err    error
+	// transient marks a failure whose cause can pass on its own, unlike a
+	// conflict, which stands until someone resolves it. Neither side of the
+	// divergence moves when a signing key is unlocked or a hook is fixed, so
+	// without this the repository would stay stopped until the next commit.
+	transient bool
+}
+
+// blocks reports whether this is the same divergence — both sides still at the
+// commits they were at — whose replay already failed. Either side moving means
+// the situation is new and worth another attempt.
+func (g *replayGuard) blocks(local, upstream string) bool {
+	return g.local != "" && g.local == local && g.upstream == upstream
+}
+
+func (g *replayGuard) remember(local, upstream, reason string, err error, transient bool) {
+	g.local, g.upstream, g.reason, g.err, g.transient = local, upstream, reason, err, transient
+}
+
+// retryTransientFailure lets a replay that stopped over something fixable be
+// attempted once more. The caller times this: the periodic cycle is a rate
+// limit the working tree's own file events are not.
+func (g *replayGuard) retryTransientFailure() {
+	if g.transient {
+		*g = replayGuard{}
+	}
+}
+
 // runCommittedSyncPhase transports only commits that already exist. It never
-// stages or creates a commit and never merges divergent histories. A push is
+// stages or creates a commit; a divergence is integrated by replaying the
+// local commits onto upstream, never by authoring a merge commit. A push is
 // safe with a dirty working tree because it changes the remote ref, not the
 // checkout, and a fast-forward is left to git to accept or refuse.
 //
 // The caller holds the configured save lock. With save-lock coordination
 // disabled, git's own overwrite checks remain the guard, but external
 // writers have no advisory-lock handshake with the daemon.
-func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.Logger) (result cycleResult, branch string, needPush bool) {
+func runCommittedSyncPhase(git GitClient, repo config.Repository, guard *replayGuard, logger *slog.Logger) (result cycleResult, branch string, needPush bool) {
 	var err error
 	branch, err = checkedOutBranch(git, repo.Branch)
 	if err != nil {
@@ -155,17 +211,18 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 		return
 	}
 	state := statemachine.Classify(ahead, behind)
-	result.Action = statemachine.ActionFor(state)
-	logger.Info("classified committed-sync state", "state", state.String(), "ahead", ahead, "behind", behind)
+	action := statemachine.CommittedSyncActionFor(state)
+	result.Action = action
+	logger.Info("classified committed-sync state", "state", state.String(), "action", action.String(), "ahead", ahead, "behind", behind)
 
-	switch state {
-	case statemachine.Equal:
+	switch action {
+	case statemachine.NoOp:
 		// A dirty tree is fine when no remote commit needs to be checked out.
 
-	case statemachine.Ahead:
+	case statemachine.Push:
 		needPush = true
 
-	case statemachine.Behind:
+	case statemachine.FastForwardMerge:
 		// Ask git instead of pre-screening the working tree. `git merge
 		// --ff-only` refuses — before touching a single file — exactly when
 		// checking out the incoming tree would overwrite modified or
@@ -176,7 +233,7 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 		// is also atomic in a way a status check followed by a merge is not.
 		if err := git.MergeFF(upstream); err != nil {
 			if refusedOverUncommittedWork(git) {
-				result.BlockedReason = BlockedDirtyBehind
+				result.BlockedReason = BlockedDirtyTree
 				result.Err = fmt.Errorf("postponing fast-forward: %w", err)
 			} else {
 				result.Err = fmt.Errorf("fast-forward merge: %w", err)
@@ -184,21 +241,88 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 			return
 		}
 
-	case statemachine.Diverged:
-		result.BlockedReason = BlockedDiverged
-		result.Err = fmt.Errorf("local and upstream histories diverged; manual merge required")
+	case statemachine.RebaseThenPush:
+		result.BlockedReason, needPush, result.Err = replayDivergence(git, upstream, guard, logger)
+
+	default:
+		result.Err = fmt.Errorf("committed-sync has no handling for action %s", action)
 	}
 	return
 }
 
-// refusedOverUncommittedWork labels a refused fast-forward without parsing
-// git's localizable message. Uncommitted work is the refusal to expect here,
-// so a dirty tree earns the blocked status that tells the user what to do.
+// replayDivergence integrates a divergence the way committed-sync's contract
+// allows: the local commits are replayed onto upstream rather than joined to it
+// by a merge commit gitloop wrote itself. Two machines committing to the same
+// branch is the ordinary way a shared checkout diverges, and neither side's
+// commits need a human to reconcile them. Rewriting them is safe because they
+// are unpushed — that is what Ahead means.
+func replayDivergence(git GitClient, upstream string, guard *replayGuard, logger *slog.Logger) (blockedReason string, needPush bool, err error) {
+	// HEAD rather than the branch name: `git rev-parse main` answers with a
+	// tag of that name before the branch, and a guard keyed on a commit that
+	// can never move would stop the repository for good. The branch is the
+	// checked-out one — checkedOutBranch has already insisted on that.
+	localHead, err := git.RevParse("HEAD")
+	if err != nil {
+		return "", false, fmt.Errorf("resolving HEAD: %w", err)
+	}
+	upstreamHead, err := git.RevParse(upstream)
+	if err != nil {
+		return "", false, fmt.Errorf("resolving %s: %w", upstream, err)
+	}
+	if guard.blocks(localHead, upstreamHead) {
+		return guard.reason, false, guard.err
+	}
+
+	paused, err := git.Rebase(upstream)
+	if paused {
+		// A conflict is the divergence the user has to merge by hand; a
+		// failing commit hook or an unavailable signing key pauses a rebase
+		// identically and needs a different fix entirely, so the blocked
+		// status is only claimed when a conflicted path is actually there.
+		conflicted, listErr := git.ConflictedFiles()
+		if listErr != nil {
+			logger.Warn("could not list conflicted paths for a paused rebase", "error", listErr)
+		}
+		if len(conflicted) > 0 {
+			blockedReason = BlockedDiverged
+		}
+		err = fmt.Errorf("replaying local commits onto %s stopped: %w", upstream, err)
+		guard.remember(localHead, upstreamHead, blockedReason, err, len(conflicted) == 0)
+		// Leaving the rebase paused would block every later cycle at PreCheck
+		// and hand the user a half-applied branch to reason about. Abort puts
+		// the branch and working tree back exactly as they were.
+		if abortErr := git.RebaseAbort(); abortErr != nil {
+			return "", false, fmt.Errorf("replaying local commits onto %s stopped and could not be aborted: %w", upstream, abortErr)
+		}
+		return blockedReason, false, err
+	}
+	if err != nil {
+		if errors.Is(err, gitcmd.ErrOperationInProgress) {
+			// Someone else's merge or rebase. It leaves the working tree
+			// dirty, so the check below would otherwise blame the user's
+			// edits for a refusal that has nothing to do with them.
+			return BlockedOperation, false, err
+		}
+		// A rebase, unlike a fast-forward, refuses over any uncommitted change
+		// rather than only the ones in its way — so this is the refusal to
+		// expect on a shared checkout, labeled the same way.
+		if refusedOverUncommittedWork(git) {
+			return BlockedDirtyTree, false, fmt.Errorf("postponing rebase: %w", err)
+		}
+		return "", false, fmt.Errorf("rebase: %w", err)
+	}
+	return "", true, nil
+}
+
+// refusedOverUncommittedWork labels a refused fast-forward or rebase without
+// parsing git's localizable message. Uncommitted work is the refusal to expect
+// in both places, so a dirty tree earns the blocked status that tells the user
+// what to do.
 //
-// The attribution is a guess, not a diagnosis: the Behind classification is
-// already stale by the time the merge runs, so a human committing in between
-// produces a divergence that gets reported as a dirty tree. Only the label is
-// at stake — the git error saying what actually happened is kept either way.
+// The attribution is a guess, not a diagnosis: the classification is already
+// stale by the time the command runs, so a human committing in between turns
+// one refusal into another and gets reported as a dirty tree. Only the label
+// is at stake — the git error saying what actually happened is kept either way.
 func refusedOverUncommittedWork(git GitClient) bool {
 	// A status that won't even read is no basis for blaming the user's edits.
 	entries, err := git.StatusPorcelain()

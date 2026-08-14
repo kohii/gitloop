@@ -17,10 +17,13 @@ type GitClient interface {
 	RemoteNames() ([]string, error)
 	Fetch(ctx context.Context, remote string) error
 	CurrentBranch() (string, error)
+	RevParse(ref string) (string, error)
 	RevListLeftRightCount(local, upstream string) (ahead, behind int, err error)
 	MergeFF(upstream string) error
 	Merge(upstream string) (conflict bool, err error)
 	MergeAbort() error
+	Rebase(upstream string) (conflict bool, err error)
+	RebaseAbort() error
 	CheckoutTheirs(path string) error
 	Push(ctx context.Context, remote, branch string) error
 	ConflictedFiles() ([]string, error)

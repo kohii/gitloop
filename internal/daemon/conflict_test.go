@@ -37,12 +37,17 @@ func (f *fakeConflictGit) Commit(msg string) error {
 func (f *fakeConflictGit) RemoteNames() ([]string, error)      { return []string{"origin"}, nil }
 func (f *fakeConflictGit) Fetch(context.Context, string) error { return nil }
 func (f *fakeConflictGit) CurrentBranch() (string, error)      { return "main", nil }
+func (f *fakeConflictGit) RevParse(ref string) (string, error) { return "commit-of-" + ref, nil }
 func (f *fakeConflictGit) RevListLeftRightCount(string, string) (int, int, error) {
 	return 0, 0, nil
 }
 func (f *fakeConflictGit) MergeFF(string) error       { return nil }
 func (f *fakeConflictGit) Merge(string) (bool, error) { return true, nil }
 func (f *fakeConflictGit) MergeAbort() error          { f.mergeAbortCalled = true; return nil }
+func (f *fakeConflictGit) Rebase(string) (bool, error) {
+	panic("the conflict-resolution path must not run a rebase")
+}
+func (f *fakeConflictGit) RebaseAbort() error { panic("no rebase to abort") }
 func (f *fakeConflictGit) CheckoutTheirs(p string) error {
 	f.checkedOutTheirs = append(f.checkedOutTheirs, p)
 	return nil
