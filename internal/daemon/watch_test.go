@@ -58,14 +58,14 @@ func (f *fakeGit) Commit(string) error {
 }
 
 func (f *fakeGit) RemoteNames() ([]string, error)                         { return []string{"origin"}, nil }
-func (f *fakeGit) Fetch(string) error                                     { return nil }
+func (f *fakeGit) Fetch(context.Context, string) error                    { return nil }
 func (f *fakeGit) CurrentBranch() (string, error)                         { return "main", nil }
 func (f *fakeGit) RevListLeftRightCount(string, string) (int, int, error) { return 0, 0, nil }
 func (f *fakeGit) MergeFF(string) error                                   { return nil }
 func (f *fakeGit) Merge(string) (bool, error)                             { return false, nil }
 func (f *fakeGit) MergeAbort() error                                      { return nil }
 func (f *fakeGit) CheckoutTheirs(string) error                            { return nil }
-func (f *fakeGit) Push(string, string) error                              { return nil }
+func (f *fakeGit) Push(context.Context, string, string) error             { return nil }
 func (f *fakeGit) ConflictedFiles() ([]string, error)                     { return nil, nil }
 func (f *fakeGit) ShowStage(int, string) (string, bool, error)            { return "", false, nil }
 
@@ -207,7 +207,7 @@ func (f *noRemoteFakeGit) ops() []string {
 	return append([]string(nil), f.remoteOps...)
 }
 
-func (f *noRemoteFakeGit) Fetch(string) error {
+func (f *noRemoteFakeGit) Fetch(context.Context, string) error {
 	f.record("fetch")
 	return errNoRemote
 }
@@ -221,7 +221,7 @@ func (f *noRemoteFakeGit) RevListLeftRightCount(string, string) (int, int, error
 	return 0, 0, errNoRemote
 }
 
-func (f *noRemoteFakeGit) Push(string, string) error {
+func (f *noRemoteFakeGit) Push(context.Context, string, string) error {
 	f.record("push")
 	return errNoRemote
 }
@@ -514,11 +514,11 @@ type callbackFakeGit struct {
 	onFetch func()
 }
 
-func (f *callbackFakeGit) Fetch(remote string) error {
+func (f *callbackFakeGit) Fetch(ctx context.Context, remote string) error {
 	if f.onFetch != nil {
 		f.onFetch()
 	}
-	return f.fakeGit.Fetch(remote)
+	return f.fakeGit.Fetch(ctx, remote)
 }
 
 // TestRunRepoLoopDoesNotHoldSaveLockDuringFetch pins the "fetch is outside
@@ -616,7 +616,7 @@ type fetchErrorFakeGit struct {
 	err error
 }
 
-func (f *fetchErrorFakeGit) Fetch(string) error { return f.err }
+func (f *fetchErrorFakeGit) Fetch(context.Context, string) error { return f.err }
 
 // TestRunRepoLoopCommitsEvenWhenFetchFailsOffline pins the "offline commit"
 // invariant: fetch failure must not skip the auto-commit phase. If a laptop
@@ -680,6 +680,281 @@ func TestRunRepoLoopCommitsEvenWhenFetchFailsOffline(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("runRepoLoop did not shut down within 2s of context cancellation")
+	}
+}
+
+type blockingFetchFakeGit struct {
+	*fakeGit
+	started chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingFetchFakeGit) Fetch(ctx context.Context, _ string) error {
+	f.once.Do(func() { close(f.started) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestRunRepoLoopCommitsAfterFetchTimeout(t *testing.T) {
+	dir := t.TempDir()
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	git := &blockingFetchFakeGit{fakeGit: &fakeGit{}, started: make(chan struct{})}
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        20 * time.Millisecond,
+		MaxWait:       2 * time.Second,
+		FetchInterval: time.Hour,
+		RemoteTimeout: 60 * time.Millisecond,
+		Mode:          config.ModeSync,
+		Remote:        "origin",
+		Branch:        "main",
+		OnConflict:    config.OnConflictBackup,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+
+	time.Sleep(50 * time.Millisecond)
+	git.markDirty()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	select {
+	case <-git.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fetch did not start")
+	}
+	waitFor(t, 2*time.Second, func() bool { return git.commitCount() == 1 })
+	waitFor(t, 2*time.Second, func() bool {
+		sf, loadErr := LoadStatusFile(statusPath)
+		if loadErr != nil {
+			return false
+		}
+		return strings.Contains(sf.Repos[dir].LastError, "fetch: timed out after 60ms")
+	})
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runRepoLoop after cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down")
+	}
+}
+
+type blockingPushFakeGit struct {
+	*fakeGit
+	started chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingPushFakeGit) RevListLeftRightCount(string, string) (int, int, error) {
+	return 1, 0, nil
+}
+
+func (f *blockingPushFakeGit) Push(ctx context.Context, _, _ string) error {
+	f.once.Do(func() { close(f.started) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestRunRepoLoopReportsPushTimeout(t *testing.T) {
+	dir := t.TempDir()
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	git := &blockingPushFakeGit{fakeGit: &fakeGit{}, started: make(chan struct{})}
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        20 * time.Millisecond,
+		MaxWait:       2 * time.Second,
+		FetchInterval: time.Hour,
+		RemoteTimeout: 60 * time.Millisecond,
+		Mode:          config.ModeSync,
+		Remote:        "origin",
+		Branch:        "main",
+		OnConflict:    config.OnConflictBackup,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	time.Sleep(50 * time.Millisecond)
+	git.markDirty()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	select {
+	case <-git.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("push did not start")
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		sf, loadErr := LoadStatusFile(statusPath)
+		if loadErr != nil {
+			return false
+		}
+		return strings.Contains(sf.Repos[dir].LastError, "push: timed out after 60ms")
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down")
+	}
+}
+
+func TestRunRepoLoopCancellationInterruptsFetch(t *testing.T) {
+	dir := t.TempDir()
+	git := &blockingFetchFakeGit{fakeGit: &fakeGit{}, started: make(chan struct{})}
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        time.Second,
+		MaxWait:       2 * time.Second,
+		FetchInterval: time.Hour,
+		RemoteTimeout: time.Hour,
+		Mode:          config.ModeCommittedSync,
+		Remote:        "origin",
+		Branch:        "main",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(filepath.Join(t.TempDir(), "status.json"))
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	select {
+	case <-git.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup fetch did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runRepoLoop after cancel: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runRepoLoop did not interrupt fetch on cancellation")
+	}
+	if got := git.commitCount(); got != 0 {
+		t.Fatalf("commit count after cancellation = %d, want 0", got)
+	}
+}
+
+type cancelingPushFakeGit struct {
+	*fakeGit
+	cancel context.CancelFunc
+}
+
+func (f *cancelingPushFakeGit) RevListLeftRightCount(string, string) (int, int, error) {
+	return 1, 0, nil
+}
+
+func (f *cancelingPushFakeGit) Push(context.Context, string, string) error {
+	f.cancel()
+	return nil
+}
+
+func TestRunRepoLoopRecordsPushThatFinishesDuringShutdown(t *testing.T) {
+	dir := t.TempDir()
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	ctx, cancel := context.WithCancel(context.Background())
+	git := &cancelingPushFakeGit{fakeGit: &fakeGit{}, cancel: cancel}
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        time.Second,
+		MaxWait:       2 * time.Second,
+		FetchInterval: time.Hour,
+		RemoteTimeout: time.Hour,
+		Mode:          config.ModeCommittedSync,
+		Remote:        "origin",
+		Branch:        "main",
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runRepoLoop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down")
+	}
+	sf, err := LoadStatusFile(statusPath)
+	if err != nil {
+		t.Fatalf("LoadStatusFile: %v", err)
+	}
+	if got := sf.Repos[dir]; got.LastPush == "" || got.LastError != "" {
+		t.Errorf("status after successful push during shutdown = %+v, want push recorded and no error", got)
+	}
+}
+
+func TestRemoteCommandContextUsesFiniteDefaultForZeroValue(t *testing.T) {
+	started := time.Now()
+	ctx, cancel := remoteCommandContext(context.Background(), 0)
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("zero-value timeout produced a context without a deadline")
+	}
+	remaining := deadline.Sub(started)
+	if remaining < config.DefaultRemoteTimeout-time.Second || remaining > config.DefaultRemoteTimeout+time.Second {
+		t.Errorf("default deadline remaining = %v, want approximately %v", remaining, config.DefaultRemoteTimeout)
+	}
+}
+
+func TestApplyInterruptedCycleProgressPreservesRemoteHealth(t *testing.T) {
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+	repoPath := "/repo"
+	lastSuccessful := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	if err := recorder.update(repoPath, func(s *RepoStatus) {
+		s.LastError = "previous remote failure"
+		s.LastSuccessfulSyncAt = lastSuccessful
+		s.Phase = PhaseIdle
+	}); err != nil {
+		t.Fatalf("seed status: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	applyInterruptedCycleProgress(recorder, repoPath, cycleResult{Committed: true, Conflict: true}, logger)
+
+	sf, err := LoadStatusFile(statusPath)
+	if err != nil {
+		t.Fatalf("LoadStatusFile: %v", err)
+	}
+	got := sf.Repos[repoPath]
+	if got.LastCommit == "" || got.Phase != PhaseConflict {
+		t.Errorf("local progress = commit:%q phase:%q, want recorded commit/conflict", got.LastCommit, got.Phase)
+	}
+	if got.LastError != "previous remote failure" || !got.LastSuccessfulSyncAt.Equal(lastSuccessful) {
+		t.Errorf("remote health changed during interrupted push: %+v", got)
 	}
 }
 
@@ -784,11 +1059,11 @@ func (f *aheadPushObserverFakeGit) RevListLeftRightCount(string, string) (int, i
 	return 1, 0, nil // ahead=1, behind=0 → Ahead → Push
 }
 
-func (f *aheadPushObserverFakeGit) Push(remote, branch string) error {
+func (f *aheadPushObserverFakeGit) Push(ctx context.Context, remote, branch string) error {
 	if f.onPush != nil {
 		f.onPush()
 	}
-	return f.fakeGit.Push(remote, branch)
+	return f.fakeGit.Push(ctx, remote, branch)
 }
 
 // TestRunRepoLoopPhaseIsIdleDuringPush pins the "phase tracks the lock

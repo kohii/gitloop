@@ -1,6 +1,7 @@
 package gitcmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,8 +29,8 @@ func (r *Runner) Commit(message string) error {
 }
 
 // Fetch runs `git fetch <remote>`.
-func (r *Runner) Fetch(remote string) error {
-	_, err := r.run("fetch", remote)
+func (r *Runner) Fetch(ctx context.Context, remote string) error {
+	_, err := r.runRemote(ctx, "fetch", remote)
 	return err
 }
 
@@ -137,8 +138,8 @@ func (r *Runner) CheckoutTheirs(path string) error {
 }
 
 // Push runs `git push <remote> <branch>`.
-func (r *Runner) Push(remote, branch string) error {
-	_, err := r.run("push", remote, branch)
+func (r *Runner) Push(ctx context.Context, remote, branch string) error {
+	_, err := r.runRemote(ctx, "push", remote, branch)
 	return err
 }
 

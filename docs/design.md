@@ -64,6 +64,28 @@ working tree is dirty, fast-forwards whenever git is willing to, and refuses
 diverged histories. It never creates a merge commit: a human must resolve a
 divergence before gitloop can transport the resulting commits.
 
+### Remote command lifetime
+
+The daemon owns the timeout policy and passes a bounded context only to fetch
+and push. `internal/gitcmd` owns process cleanup: it starts remote commands in
+a new process group, sends TERM on cancellation, then sends KILL to surviving
+members after a grace period or once Git itself has exited. The group boundary
+matters because Git delegates network I/O to transports such as SSH; killing
+only Git can leave that child alive indefinitely.
+
+`remote_timeout` is the point at which termination begins, not the final return
+deadline. A remote operation may take the short TERM grace and pipe-drain delay
+beyond it before the repository loop resumes.
+
+The same bounded pipe wait also applies after a successful Git exit, so a
+detached helper that inherits stdout or stderr cannot hold the repository loop
+open indefinitely. Git's successful exit remains the operation result.
+
+Local operations have no generic deadline. Interrupting commit or merge can
+leave the index or working tree in an intermediate state, while a failed
+remote operation can safely be retried from repository state on the next
+cycle.
+
 ### Why git decides whether a fast-forward is safe
 
 Requiring a clean working tree is the obvious rule and the wrong one: on a

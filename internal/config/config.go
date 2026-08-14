@@ -40,6 +40,10 @@ const (
 	WorkflowCommittedSync  WorkflowType = "committed-sync"
 )
 
+// DefaultRemoteTimeout bounds each individual fetch or push when no explicit
+// timeout is configured.
+const DefaultRemoteTimeout = time.Minute
+
 // OnConflict selects how gitloop resolves a real (non-fast-forwardable)
 // merge conflict.
 type OnConflict string
@@ -66,6 +70,7 @@ type Defaults struct {
 	Settle        time.Duration
 	MaxWait       time.Duration
 	FetchInterval time.Duration
+	RemoteTimeout time.Duration
 	Mode          Mode
 	Remote        string
 	Branch        string
@@ -88,6 +93,7 @@ var builtinDefaults = Defaults{
 	Settle:        3 * time.Second,
 	MaxWait:       60 * time.Second,
 	FetchInterval: 30 * time.Second,
+	RemoteTimeout: DefaultRemoteTimeout,
 	Mode:          ModeSync,
 	Remote:        "origin",
 	Branch:        "",
@@ -109,6 +115,10 @@ type Repository struct {
 	// and under an auto-commit-only workflow it catches working-tree changes the
 	// file watcher missed.
 	FetchInterval time.Duration
+	// RemoteTimeout is how long a fetch or push may run before termination
+	// begins. It does not apply to local Git operations that could leave the
+	// working tree or index half-mutated if interrupted.
+	RemoteTimeout time.Duration
 	// Mode is the legacy workflow selector. Under ModeCommitOnly, Remote and
 	// Branch are unused; ModeCommittedSync uses them without auto-committing.
 	Mode Mode
@@ -208,6 +218,7 @@ type rawRepository struct {
 	Settle        string       `yaml:"settle"`
 	MaxWait       string       `yaml:"max_wait"`
 	FetchInterval string       `yaml:"fetch_interval"`
+	RemoteTimeout string       `yaml:"remote_timeout"`
 	Mode          string       `yaml:"mode"`
 	Remote        string       `yaml:"remote"`
 	Branch        string       `yaml:"branch"`
@@ -217,20 +228,22 @@ type rawRepository struct {
 }
 
 type rawWorkflow struct {
-	Type         string  `yaml:"type"`
-	Remote       string  `yaml:"remote"`
-	Branch       string  `yaml:"branch"`
-	Interval     string  `yaml:"interval"`
-	Settle       string  `yaml:"settle"`
-	MaxWait      string  `yaml:"max_wait"`
-	OnConflict   string  `yaml:"on_conflict"`
-	SaveLockPath *string `yaml:"save_lock_path"`
+	Type          string  `yaml:"type"`
+	Remote        string  `yaml:"remote"`
+	Branch        string  `yaml:"branch"`
+	Interval      string  `yaml:"interval"`
+	Settle        string  `yaml:"settle"`
+	MaxWait       string  `yaml:"max_wait"`
+	OnConflict    string  `yaml:"on_conflict"`
+	SaveLockPath  *string `yaml:"save_lock_path"`
+	RemoteTimeout string  `yaml:"remote_timeout"`
 }
 
 type rawDefaults struct {
 	Settle        string  `yaml:"settle"`
 	MaxWait       string  `yaml:"max_wait"`
 	FetchInterval string  `yaml:"fetch_interval"`
+	RemoteTimeout string  `yaml:"remote_timeout"`
 	Mode          string  `yaml:"mode"`
 	Remote        string  `yaml:"remote"`
 	Branch        string  `yaml:"branch"`
@@ -291,6 +304,9 @@ func resolveDefaults(raw rawDefaults) (Defaults, error) {
 	if d.FetchInterval, err = parseDurationOr(raw.FetchInterval, d.FetchInterval, "fetch_interval"); err != nil {
 		return Defaults{}, err
 	}
+	if d.RemoteTimeout, err = parseDurationOr(raw.RemoteTimeout, d.RemoteTimeout, "remote_timeout"); err != nil {
+		return Defaults{}, err
+	}
 	if raw.Mode != "" {
 		m, err := parseMode(raw.Mode)
 		if err != nil {
@@ -330,6 +346,7 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 		Settle:           defaults.Settle,
 		MaxWait:          defaults.MaxWait,
 		FetchInterval:    defaults.FetchInterval,
+		RemoteTimeout:    defaults.RemoteTimeout,
 		Mode:             defaults.Mode,
 		Workflow:         workflowForMode(defaults.Mode),
 		Remote:           defaults.Remote,
@@ -346,6 +363,9 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 		return Repository{}, err
 	}
 	if repo.FetchInterval, err = parseDurationOr(raw.FetchInterval, repo.FetchInterval, "fetch_interval"); err != nil {
+		return Repository{}, err
+	}
+	if repo.RemoteTimeout, err = parseDurationOr(raw.RemoteTimeout, repo.RemoteTimeout, "remote_timeout"); err != nil {
 		return Repository{}, err
 	}
 	if raw.Mode != "" {
@@ -378,7 +398,6 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 			return Repository{}, err
 		}
 	}
-
 	if raw.Workflow != nil {
 		if raw.Mode != "" {
 			return Repository{}, fmt.Errorf("workflow cannot be combined with mode")
@@ -440,8 +459,8 @@ func validateCommittedSyncLegacyFields(raw rawRepository) error {
 // rejected when the nested form also specifies the same value.
 func applyWorkflow(repo Repository, raw rawRepository, wf *rawWorkflow, workflow WorkflowType) (Repository, error) {
 	if workflow == WorkflowAutoCommitOnly {
-		if wf.Remote != "" || wf.Branch != "" || wf.OnConflict != "" || raw.Remote != "" || raw.Branch != "" || raw.OnConflict != "" {
-			return Repository{}, fmt.Errorf("workflow.type %q does not accept remote, branch, or on_conflict", workflow)
+		if wf.Remote != "" || wf.Branch != "" || wf.OnConflict != "" || wf.RemoteTimeout != "" || raw.Remote != "" || raw.Branch != "" || raw.OnConflict != "" || raw.RemoteTimeout != "" {
+			return Repository{}, fmt.Errorf("workflow.type %q does not accept remote, branch, remote_timeout, or on_conflict", workflow)
 		}
 	}
 	if workflow == WorkflowCommittedSync && (raw.Settle != "" || raw.MaxWait != "" || raw.OnConflict != "" || wf.Settle != "" || wf.MaxWait != "" || wf.OnConflict != "") {
@@ -469,6 +488,16 @@ func applyWorkflow(repo Repository, raw rawRepository, wf *rawWorkflow, workflow
 			return Repository{}, err
 		}
 		repo.FetchInterval = d
+	}
+	if wf.RemoteTimeout != "" {
+		if raw.RemoteTimeout != "" {
+			return Repository{}, fmt.Errorf("workflow.remote_timeout cannot be combined with remote_timeout")
+		}
+		d, err := parseDurationOr(wf.RemoteTimeout, repo.RemoteTimeout, "workflow.remote_timeout")
+		if err != nil {
+			return Repository{}, err
+		}
+		repo.RemoteTimeout = d
 	}
 	if wf.Settle != "" {
 		if raw.Settle != "" {
