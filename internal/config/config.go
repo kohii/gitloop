@@ -115,9 +115,9 @@ type Repository struct {
 	// and under an auto-commit-only workflow it catches working-tree changes the
 	// file watcher missed.
 	FetchInterval time.Duration
-	// RemoteTimeout is the hard deadline for each fetch or push. It does not
-	// apply to local Git operations that could leave the working tree or index
-	// half-mutated if interrupted.
+	// RemoteTimeout is how long a fetch or push may run before termination
+	// begins. It does not apply to local Git operations that could leave the
+	// working tree or index half-mutated if interrupted.
 	RemoteTimeout time.Duration
 	// Mode is the legacy workflow selector. Under ModeCommitOnly, Remote and
 	// Branch are unused; ModeCommittedSync uses them without auto-committing.
@@ -398,10 +398,6 @@ func resolveRepository(raw rawRepository, defaults Defaults) (Repository, error)
 			return Repository{}, err
 		}
 	}
-	if repo.Mode == ModeCommitOnly && raw.Workflow == nil && raw.RemoteTimeout != "" {
-		return Repository{}, fmt.Errorf("mode %q does not accept remote_timeout", ModeCommitOnly)
-	}
-
 	if raw.Workflow != nil {
 		if raw.Mode != "" {
 			return Repository{}, fmt.Errorf("workflow cannot be combined with mode")

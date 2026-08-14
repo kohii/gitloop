@@ -77,6 +77,10 @@ only Git can leave that child alive indefinitely.
 deadline. A remote operation may take the short TERM grace and pipe-drain delay
 beyond it before the repository loop resumes.
 
+The same bounded pipe wait also applies after a successful Git exit, so a
+detached helper that inherits stdout or stderr cannot hold the repository loop
+open indefinitely. Git's successful exit remains the operation result.
+
 Local operations have no generic deadline. Interrupting commit or merge can
 leave the index or working tree in an intermediate state, while a failed
 remote operation can safely be retried from repository state on the next

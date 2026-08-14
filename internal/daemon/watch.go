@@ -166,6 +166,8 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 				if err == nil {
 					result.Pushed = true
 					applyCycleResult(recorder, repo.Path, result, logger)
+				} else {
+					applyInterruptedCycleProgress(recorder, repo.Path, result, logger)
 				}
 				return
 			}
@@ -279,6 +281,23 @@ func annotateRemoteError(err error, timeout time.Duration) error {
 		return fmt.Errorf("timed out after %s: %w", timeout, err)
 	}
 	return err
+}
+
+// applyInterruptedCycleProgress records local work that completed before a
+// shutdown canceled push. It deliberately preserves remote health fields: an
+// interrupted push is neither a successful sync nor a new persistent error.
+func applyInterruptedCycleProgress(recorder *statusRecorder, repoPath string, result cycleResult, logger *slog.Logger) {
+	err := recorder.update(repoPath, func(s *RepoStatus) {
+		if result.Committed {
+			s.LastCommit = time.Now().Format(time.RFC3339)
+		}
+		if result.Conflict {
+			s.Phase = PhaseConflict
+		}
+	})
+	if err != nil {
+		logger.Error("writing interrupted cycle progress failed", "error", err)
+	}
 }
 
 // resolveRepositoryMode turns the legacy omitted mode into commit-only when

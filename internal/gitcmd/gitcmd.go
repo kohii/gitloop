@@ -95,16 +95,17 @@ func (r *Runner) runRemote(ctx context.Context, args ...string) (Result, error) 
 	}
 
 	res, runErr := r.runCommand(cmd, args)
-	// WaitDelay also fires after a successful process exit when an unrelated
-	// descendant inherited stdout or stderr. The pipe has been closed by exec
-	// at this point, and Git's successful ProcessState remains authoritative.
-	if errors.Is(runErr, exec.ErrWaitDelay) && !cancellationStarted.Load() &&
-		cmd.ProcessState != nil && cmd.ProcessState.Success() {
+	// WaitDelay can fire after a successful process exit when an unrelated
+	// descendant inherited stdout or stderr. CommandContext can likewise
+	// report ctx.Err when cancellation races with an exit 0. In both cases
+	// Git's successful ProcessState remains authoritative.
+	if runErr != nil && cmd.ProcessState != nil && cmd.ProcessState.Success() &&
+		(errors.Is(runErr, exec.ErrWaitDelay) || cancellationStarted.Load()) {
 		runErr = nil
 	}
 	// The direct git process can exit on SIGTERM before a transport child that
 	// ignored the same signal. Once git itself is gone there is no useful
-	// graceful work left for those descendants to perform, so reap any
+	// graceful work left for those descendants to perform, so terminate any
 	// surviving members before disarming the delayed group kill.
 	if cancellationStarted.Load() && cmd.Process != nil {
 		_ = signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
@@ -112,7 +113,7 @@ func (r *Runner) runRemote(ctx context.Context, args ...string) (Result, error) 
 	close(commandDone)
 	if ctxErr := ctx.Err(); cancellationStarted.Load() && ctxErr != nil && runErr != nil {
 		var gitErr *Error
-		if errors.As(runErr, &gitErr) {
+		if errors.As(runErr, &gitErr) && !errors.Is(gitErr.Err, ctxErr) {
 			// Multiple %w operands preserve errors.Is for both causes without
 			// errors.Join's newline, which would corrupt tabular status output.
 			gitErr.Err = fmt.Errorf("%w: %w", ctxErr, gitErr.Err)

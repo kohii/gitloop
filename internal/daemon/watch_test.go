@@ -926,6 +926,38 @@ func TestRemoteCommandContextUsesFiniteDefaultForZeroValue(t *testing.T) {
 	}
 }
 
+func TestApplyInterruptedCycleProgressPreservesRemoteHealth(t *testing.T) {
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+	repoPath := "/repo"
+	lastSuccessful := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
+	if err := recorder.update(repoPath, func(s *RepoStatus) {
+		s.LastError = "previous remote failure"
+		s.LastSuccessfulSyncAt = lastSuccessful
+		s.Phase = PhaseIdle
+	}); err != nil {
+		t.Fatalf("seed status: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	applyInterruptedCycleProgress(recorder, repoPath, cycleResult{Committed: true, Conflict: true}, logger)
+
+	sf, err := LoadStatusFile(statusPath)
+	if err != nil {
+		t.Fatalf("LoadStatusFile: %v", err)
+	}
+	got := sf.Repos[repoPath]
+	if got.LastCommit == "" || got.Phase != PhaseConflict {
+		t.Errorf("local progress = commit:%q phase:%q, want recorded commit/conflict", got.LastCommit, got.Phase)
+	}
+	if got.LastError != "previous remote failure" || !got.LastSuccessfulSyncAt.Equal(lastSuccessful) {
+		t.Errorf("remote health changed during interrupted push: %+v", got)
+	}
+}
+
 // panicOnCommitFakeGit is a fakeGit whose Commit panics on first call. It's
 // used to exercise the "panic inside the commit/integrate phase must not
 // leak the save lock" invariant.

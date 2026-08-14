@@ -248,6 +248,24 @@ defaults:
 	}
 }
 
+func TestParseLegacyCommitOnlyAllowsIgnoredRemoteSettings(t *testing.T) {
+	cfg, err := Parse([]byte(`
+repositories:
+  - path: ~/notes
+    mode: commit-only
+    remote: origin
+    branch: main
+    on_conflict: claude
+    remote_timeout: 1m
+`))
+	if err != nil {
+		t.Fatalf("Parse legacy commit-only settings: %v", err)
+	}
+	if got := cfg.Repositories[0].RemoteTimeout; got != time.Minute {
+		t.Errorf("RemoteTimeout = %v, want parsed legacy value 1m", got)
+	}
+}
+
 func TestParseRejectsUnknownMode(t *testing.T) {
 	cases := map[string]string{
 		"per repo": "repositories:\n  - path: ~/notes\n    mode: offline\n",
@@ -325,11 +343,6 @@ func TestParseWorkflowRejectsInvalidCombinations(t *testing.T) {
     workflow:
       type: auto-commit-only
       remote_timeout: 1m
-`,
-		"legacy commit-only remote timeout": `repositories:
-  - path: ~/journal
-    mode: commit-only
-    remote_timeout: 1m
 `,
 		"duplicate remote timeout": `repositories:
   - path: ~/notes

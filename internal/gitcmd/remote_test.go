@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -27,10 +28,18 @@ func TestFetchTimeoutKillsTransportAndAllowsNextFetch(t *testing.T) {
 	ctx := &triggeredDeadlineContext{done: make(chan struct{})}
 	errCh := make(chan error, 1)
 	go func() { errCh <- runner.Fetch(ctx, "origin") }()
+	fetchDone := false
+	defer func() {
+		ctx.expire()
+		if !fetchDone {
+			<-errCh
+		}
+	}()
 	readRecordedPID(t, filepath.Join(pidDir, "parent.pid"))
 	readRecordedPID(t, filepath.Join(pidDir, "child.pid"))
-	close(ctx.done)
+	ctx.expire()
 	err := <-errCh
+	fetchDone = true
 	if err == nil {
 		t.Fatal("Fetch = nil, want timeout")
 	}
@@ -51,11 +60,13 @@ func TestFetchTimeoutKillsTransportAndAllowsNextFetch(t *testing.T) {
 
 type triggeredDeadlineContext struct {
 	done chan struct{}
+	once sync.Once
 }
 
 func (c *triggeredDeadlineContext) Deadline() (time.Time, bool) { return time.Time{}, false }
 func (c *triggeredDeadlineContext) Done() <-chan struct{}       { return c.done }
 func (c *triggeredDeadlineContext) Value(any) any               { return nil }
+func (c *triggeredDeadlineContext) expire()                     { c.once.Do(func() { close(c.done) }) }
 func (c *triggeredDeadlineContext) Err() error {
 	select {
 	case <-c.done:
@@ -89,6 +100,31 @@ echo success
 	}
 	if strings.TrimSpace(res.Stdout) != "success" {
 		t.Errorf("stdout = %q, want success", res.Stdout)
+	}
+}
+
+func TestRemoteCancellationRacePreservesSuccessfulExit(t *testing.T) {
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "command.pid")
+	executable := filepath.Join(t.TempDir(), "term-success-command")
+	script := `#!/bin/sh
+echo $$ > "` + pidPath + `"
+trap 'exit 0' TERM
+while :; do sleep 1; done
+`
+	if err := os.WriteFile(executable, []byte(script), 0o755); err != nil {
+		t.Fatalf("write TERM-success command: %v", err)
+	}
+	runner := New(dir)
+	runner.executable = executable
+	runner.terminationGrace = 100 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- runner.Fetch(ctx, "origin") }()
+	readRecordedPID(t, pidPath)
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Fetch = %v, want exit 0 to win a cancellation race", err)
 	}
 }
 
@@ -162,12 +198,10 @@ func readRecordedPID(t *testing.T, path string) int {
 		data, err := os.ReadFile(path)
 		if err == nil {
 			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-			if parseErr != nil {
-				t.Fatalf("parse PID in %s: %v", path, parseErr)
+			if parseErr == nil {
+				return pid
 			}
-			return pid
-		}
-		if !os.IsNotExist(err) {
+		} else if !os.IsNotExist(err) {
 			t.Fatalf("read PID from %s: %v", path, err)
 		}
 		if time.Now().After(deadline) {
