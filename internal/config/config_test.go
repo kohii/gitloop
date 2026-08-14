@@ -29,7 +29,7 @@ repositories:
 		Settle:        3 * time.Second,
 		MaxWait:       60 * time.Second,
 		FetchInterval: 30 * time.Second,
-		RemoteTimeout: 10 * time.Minute,
+		RemoteTimeout: time.Minute,
 		Mode:          ModeSync,
 		Workflow:      WorkflowAutoCommitSync,
 		Remote:        "origin",

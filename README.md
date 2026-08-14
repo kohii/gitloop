@@ -47,7 +47,7 @@ defaults:
   settle: 3s           # debounce: commit `settle` after the last file change
   max_wait: 60s        # ...but never wait longer than this while changes keep arriving
   fetch_interval: 30s  # also fetch on a timer, to notice remote-only changes
-  remote_timeout: 10m  # deadline before terminating a fetch or push
+  remote_timeout: 1m   # deadline before terminating a fetch or push
   mode: sync           # optional: "sync" or "commit-only"
   remote: origin
   branch: ""           # empty = whatever is currently checked out

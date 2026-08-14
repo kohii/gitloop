@@ -42,7 +42,7 @@ const (
 
 // DefaultRemoteTimeout bounds each individual fetch or push when no explicit
 // timeout is configured.
-const DefaultRemoteTimeout = 10 * time.Minute
+const DefaultRemoteTimeout = time.Minute
 
 // OnConflict selects how gitloop resolves a real (non-fast-forwardable)
 // merge conflict.
