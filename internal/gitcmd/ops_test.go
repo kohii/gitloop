@@ -40,6 +40,15 @@ func writeFile(t *testing.T, dir, name, content string) {
 	}
 }
 
+func readFile(t *testing.T, dir, name string) string {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(content)
+}
+
 func TestAddAllAndCommit(t *testing.T) {
 	requireGit(t)
 	dir := t.TempDir()
@@ -132,6 +141,92 @@ func TestFetchAndRevListLeftRightCount(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(localDir, "b.md")); err != nil {
 		t.Errorf("expected b.md to exist after fast-forward merge: %v", err)
+	}
+}
+
+// behindRepo builds a repository on main, one commit behind a local
+// "upstream" branch that rewrites upstreamFile.
+func behindRepo(t *testing.T, dir, upstreamFile string) *Runner {
+	t.Helper()
+	r := initRepo(t, dir)
+	writeFile(t, dir, "a.md", "a base\n")
+	writeFile(t, dir, "b.md", "b base\n")
+	if err := r.AddAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Commit("base"); err != nil {
+		t.Fatal(err)
+	}
+
+	runIn(t, dir, "checkout", "-q", "-b", "upstream")
+	writeFile(t, dir, upstreamFile, "upstream\n")
+	runIn(t, dir, "add", "-A")
+	runIn(t, dir, "commit", "-q", "-m", "upstream change")
+	runIn(t, dir, "checkout", "-q", "main")
+	return r
+}
+
+// TestMergeFFSucceedsWithUnrelatedLocalChanges pins the git behavior that
+// lets committed-sync attempt a fast-forward over a dirty working tree: only
+// the paths the incoming commits rewrite are in the way.
+func TestMergeFFSucceedsWithUnrelatedLocalChanges(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := behindRepo(t, dir, "b.md")
+	writeFile(t, dir, "a.md", "a uncommitted\n")
+
+	if err := r.MergeFF("upstream"); err != nil {
+		t.Fatalf("MergeFF with an unrelated dirty file: %v", err)
+	}
+	if got := readFile(t, dir, "b.md"); got != "upstream\n" {
+		t.Errorf("b.md = %q, want the upstream content", got)
+	}
+	if got := readFile(t, dir, "a.md"); got != "a uncommitted\n" {
+		t.Errorf("a.md = %q, want the uncommitted content preserved", got)
+	}
+}
+
+// TestMergeFFRefusesToOverwriteLocalChanges is the other half of that
+// contract, and the reason no pre-flight check is needed: git turns the
+// merge down without having written anything.
+func TestMergeFFRefusesToOverwriteLocalChanges(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := behindRepo(t, dir, "a.md")
+	writeFile(t, dir, "a.md", "uncommitted\n")
+
+	if err := r.MergeFF("upstream"); err == nil {
+		t.Fatal("MergeFF() = nil, want a refusal to overwrite local changes")
+	}
+	if got := readFile(t, dir, "a.md"); got != "uncommitted\n" {
+		t.Errorf("a.md = %q, want the uncommitted content left alone", got)
+	}
+}
+
+// TestMergeFFIgnoresConfiguredAutostash guards the refusal above against a
+// user's own git config. With merge.autostash left on, git stashes, fast-
+// forwards, fails to unstash, and still exits 0 — handing a daemon a
+// "successful" merge whose working tree is full of conflict markers. The
+// suppression has to work on gits predating `--no-autostash` too, which is
+// why MergeFF spells it as a `-c` override.
+func TestMergeFFIgnoresConfiguredAutostash(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := behindRepo(t, dir, "a.md")
+	runIn(t, dir, "config", "merge.autostash", "true")
+	writeFile(t, dir, "a.md", "uncommitted\n")
+
+	if err := r.MergeFF("upstream"); err == nil {
+		t.Fatal("MergeFF() = nil, want the refusal to survive merge.autostash")
+	}
+	if got := readFile(t, dir, "a.md"); got != "uncommitted\n" {
+		t.Errorf("a.md = %q, want the uncommitted content left alone", got)
+	}
+	if got := strings.TrimSpace(runOut(t, dir, "stash", "list")); got != "" {
+		t.Errorf("stash list = %q, want no stash entry left behind", got)
 	}
 }
 
@@ -302,4 +397,16 @@ func runIn(t *testing.T, dir string, args ...string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v (dir=%s): %v\n%s", args, dir, err, out)
 	}
+}
+
+func runOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v (dir=%s): %v", args, dir, err)
+	}
+	return string(out)
 }

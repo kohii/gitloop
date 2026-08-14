@@ -81,11 +81,22 @@ func parseLeftRightCount(output string) (ahead, behind int, err error) {
 }
 
 // MergeFF fast-forwards the current branch to upstream
-// (`git merge --ff-only <upstream>`). It fails if a fast-forward isn't
-// possible, which should not happen for callers that only invoke it in the
-// Behind state.
+// (`git merge --ff-only <upstream>`). It fails if the branch isn't behind
+// upstream, and also if checking out the incoming tree would overwrite a
+// modified or untracked file — the refusal that lets callers attempt a
+// fast-forward over a dirty working tree without risking it, because git
+// checks every path before it writes any of them.
+//
+// Overriding merge.autoStash is what keeps that refusal intact. A user's
+// `merge.autostash = true` would otherwise turn it into a stash, a
+// fast-forward, and a failed unstash that exits 0 while leaving conflict
+// markers in the working tree and a stash entry behind — a silent success as
+// far as a daemon can tell. The override is spelled as `-c` rather than
+// `--no-autostash` because the flag only exists in git 2.27 and later, where
+// the config key it suppresses does too: older gits ignore the unknown key
+// and have no autostash to suppress, so one form works everywhere.
 func (r *Runner) MergeFF(upstream string) error {
-	_, err := r.run("merge", "--ff-only", upstream)
+	_, err := r.run("-c", "merge.autoStash=false", "merge", "--ff-only", upstream)
 	return err
 }
 

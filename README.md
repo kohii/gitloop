@@ -213,18 +213,27 @@ Each cycle fetches the remote and classifies the checked-out branch:
 |--------------|-------|--------|
 | clean or dirty | equal | nothing |
 | clean or dirty | ahead | push existing commits |
-| clean | behind | fast-forward |
-| dirty | behind | defer and report `dirty-working-tree` |
+| clean, or dirty outside the incoming commits | behind | fast-forward |
+| dirty in a file the incoming commits rewrite | behind | defer and report `dirty-working-tree` |
 | clean or dirty | diverged | defer and report `diverged-history` |
 
-Fetching and pushing existing commits are safe while files are being edited.
-Updating the checked-out branch is deliberately limited to a clean working
-tree, and divergent histories are left for a human to merge or rebase. The
-periodic `interval` is important because a manual commit changes `.git`, which
-does not produce a watched working-tree event. If another process writes the
-checkout concurrently, configure `save_lock_path` and have that process hold
-the same advisory lock; without it, Git's own clean-tree checks are the final
-guard but there is no coordination handshake.
+Fetching and pushing existing commits are safe while files are being edited,
+and so is a fast-forward that rewrites none of them. gitloop just runs
+`git merge --ff-only` and lets Git refuse — leaving the checkout untouched —
+when the update would overwrite modified or untracked content, so editing one
+file doesn't hold the whole repository behind upstream. Divergent histories
+are left for a human to merge or rebase.
+
+One thing this does not protect: a file you keep locally but `.gitignore` is
+overwritten without warning if the remote starts tracking that path, because
+Git treats ignored files as expendable. That is true of any `git merge`, not
+just gitloop's.
+
+The periodic `interval` is important because a manual commit changes `.git`,
+which does not produce a watched working-tree event. If another process writes
+the checkout concurrently, configure `save_lock_path` and have that process
+hold the same advisory lock; without it, Git's own overwrite checks are the
+final guard but there is no coordination handshake.
 
 ## Conflict resolution
 

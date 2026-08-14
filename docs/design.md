@@ -60,11 +60,57 @@ nested `workflow` tag. The three workflow contracts are:
   staging or creating a commit.
 
 `committed-sync` fetches on every cycle, pushes an ahead branch even when the
-working tree is dirty, fast-forwards only a clean working tree, and refuses
+working tree is dirty, fast-forwards whenever git is willing to, and refuses
 diverged histories. It never creates a merge commit: a human must resolve a
-divergence before gitloop can transport the resulting commits. The dirty check
-is repeated immediately before a fast-forward while the save lock is held, so
-a save arriving during classification cannot be overwritten.
+divergence before gitloop can transport the resulting commits.
+
+### Why git decides whether a fast-forward is safe
+
+Requiring a clean working tree is the obvious rule and the wrong one: on a
+shared checkout some file is almost always uncommitted, so the branch stays
+behind upstream indefinitely even though the incoming commits rewrite nothing
+the user is editing. `git merge --ff-only` already refuses precisely — and
+only — when checking out the incoming tree would overwrite a modified or
+untracked path, and it validates every path before writing any of them, so a
+refusal leaves the checkout exactly as it was.
+
+`runCommittedSyncPhase` therefore just runs the merge and reads the outcome.
+Predicting the answer first — intersecting `git status --porcelain` against
+`git diff --name-only` — was tried and dropped, and is worth not
+re-inventing. It re-implements git's unpack-trees check from two commands
+that don't agree on how to spell a path: `git status --porcelain` C-quotes
+anything containing a space, `git diff --name-only` doesn't, so `sp ace.md`
+never matches itself and the intersection quietly comes up empty for exactly
+the filenames a notes vault is full of. Untracked directories, which status
+collapses to a single `dir/` line, are a second such seam. And the prediction
+buys nothing: a refused merge costs one cheap local command, and its error
+already names every path in the way. Skipping it also removes a
+check-then-act window — the merge is atomic where a status check followed by
+a merge is not.
+
+A refusal is attributed by asking `git status --porcelain` afterwards: a dirty
+tree earns `blocked_reason: dirty-working-tree`, and anything else keeps the
+raw git error. That is a labeling decision, not a safety one, so it needs no
+parsing of git's localizable message.
+
+`MergeFF` runs with `-c merge.autoStash=false` to keep that refusal from being
+reinterpreted by the user's own git config. Under `merge.autostash = true`, git
+stashes the conflicting changes, fast-forwards, fails to reapply them, and
+**exits 0** — handing the daemon a successful merge whose working tree holds
+conflict markers and whose stash holds the user's work. No `MERGE_HEAD` is
+written, so `PreCheck` would not catch it on the next cycle either. The `-c`
+override is used rather than the `--no-autostash` flag because that flag only
+exists in git 2.27 and later, alongside the config key it suppresses: older
+gits ignore the unknown key and have no autostash to begin with, so one
+spelling covers every version and the "works with whatever git you have"
+property above survives.
+
+The one thing neither gitloop nor git guards: a locally-kept file matched by
+`.gitignore` is silently overwritten if upstream starts tracking that path.
+Git considers ignored files expendable, and `git status --porcelain` doesn't
+report them, so the situation is invisible from here. This predates the
+change above — a clean-tree rule doesn't help, since the overwrite happens on
+whichever cycle finds the tree clean.
 
 ## Sync state table
 
@@ -110,8 +156,8 @@ working-tree changes the watcher missed.
 
 **Committed-sync repositories stop before the commit step.** They still fetch
 and classify the local branch, but only take these actions: no-op for Equal,
-push for Ahead, fast-forward for clean Behind, and a reported blocked state
-for dirty Behind or Diverged. This mode is intentionally stricter than a
+push for Ahead, an attempted fast-forward for Behind, and a reported blocked
+state for a refused fast-forward or for Diverged. This mode is stricter than a
 generic `auto_commit: false` flag: it prevents a future integration policy
 from silently creating merge commits under a workflow whose contract is that
 commits are human-created.
@@ -323,8 +369,8 @@ handshake:
        via `defer` in addition to being called explicitly at the end of
        the phase, so a panic inside a merge or conflict-resolution step
        can't leak the flock and deadlock every subsequent cycle.
-       In `committed-sync`, this phase only checks status and performs a
-       clean-tree fast-forward; it never stages, commits, or merges.
+       In `committed-sync`, this phase only attempts a fast-forward; it
+       never stages, commits, or merges.
     3. **Push (lock released)**: push if the state was Ahead or Diverged.
        Like fetch, this is network I/O that doesn't touch the working
        tree; holding the lock across a slow push would just delay the
