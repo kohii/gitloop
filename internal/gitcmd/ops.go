@@ -129,6 +129,43 @@ func (r *Runner) MergeAbort() error {
 	return err
 }
 
+// Rebase replays the current branch's local-only commits on top of upstream
+// (`git rebase <upstream>`). Callers use it where a merge commit would be
+// unwelcome; the commits it rewrites are by definition unpushed, so nothing
+// outside this checkout can be built on the versions it replaces. Commits
+// already applied upstream are dropped by git's own patch-id check, which is
+// what makes the same edit committed on two machines converge instead of
+// conflicting.
+//
+// If the rebase stops on a conflict, Rebase returns (true, nil) rather than an
+// error, mirroring Merge: a paused rebase is an outcome the caller must decide
+// about, not a failed invocation. Every other non-zero exit — a dirty working
+// tree being the one to expect — is returned as an error with the rebase not
+// started.
+//
+// rebase.autoStash is overridden for the same reason MergeFF suppresses
+// merge.autoStash: under a user's `rebase.autostash = true`, git stashes the
+// uncommitted work, rebases, and can fail to reapply it, leaving conflict
+// markers in the working tree and the user's work in a stash entry. Refusing
+// outright gives the caller a dirty tree to report instead.
+func (r *Runner) Rebase(upstream string) (conflict bool, err error) {
+	_, runErr := r.run("-c", "rebase.autoStash=false", "rebase", upstream)
+	if runErr == nil {
+		return false, nil
+	}
+	if r.hasRebaseInProgress() {
+		return true, nil
+	}
+	return false, runErr
+}
+
+// RebaseAbort cancels an in-progress rebase and restores the branch and
+// working tree to their pre-rebase state (`git rebase --abort`).
+func (r *Runner) RebaseAbort() error {
+	_, err := r.run("rebase", "--abort")
+	return err
+}
+
 // CheckoutTheirs replaces path's working-tree and index content with the
 // incoming side of an in-progress merge conflict
 // (`git checkout --theirs -- <path>`).
@@ -181,9 +218,37 @@ func (r *Runner) ShowStage(stage int, path string) (content string, ok bool, err
 	return res.Stdout, true, nil
 }
 
-// hasMergeInProgress reports whether .git/MERGE_HEAD exists, i.e. a merge is
-// currently paused on a conflict.
+// hasMergeInProgress reports whether a merge is currently paused on a
+// conflict.
 func (r *Runner) hasMergeInProgress() bool {
-	_, err := os.Stat(filepath.Join(r.Dir, ".git", "MERGE_HEAD"))
-	return err == nil
+	return r.gitPathExists("MERGE_HEAD")
+}
+
+// hasRebaseInProgress reports whether a rebase is currently paused. Both
+// backends are checked: the merge backend writes rebase-merge, and the older
+// apply backend (`git rebase --apply`, or a git predating 2.26) writes
+// rebase-apply.
+func (r *Runner) hasRebaseInProgress() bool {
+	return r.gitPathExists("rebase-merge") || r.gitPathExists("rebase-apply")
+}
+
+// gitPathExists reports whether name exists inside the repository's git
+// directory. The location is resolved by git rather than assumed to be
+// `<dir>/.git/<name>`, so a linked worktree — whose .git is a file pointing
+// at a per-worktree directory elsewhere — is answered about correctly.
+func (r *Runner) gitPathExists(name string) bool {
+	res, err := r.run("rev-parse", "--git-path", name)
+	if err != nil {
+		return false
+	}
+	path := strings.TrimSpace(res.Stdout)
+	if path == "" {
+		return false
+	}
+	if !filepath.IsAbs(path) {
+		// --git-path answers relative to the repository the command ran in.
+		path = filepath.Join(r.Dir, path)
+	}
+	_, statErr := os.Stat(path)
+	return statErr == nil
 }

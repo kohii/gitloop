@@ -25,17 +25,18 @@ type cycleResult struct {
 	// files in the working tree that still need attention.
 	Conflict bool
 	// BlockedReason is a stable status-facing reason for a deliberate
-	// committed-sync refusal, such as a dirty working tree behind upstream or
-	// divergent histories. It is intentionally separate from Err so callers
-	// can display a concise actionable status while retaining the full error.
+	// committed-sync refusal, such as a dirty working tree or a divergence
+	// that could not be replayed. It is intentionally separate from Err so
+	// callers can display a concise actionable status while retaining the
+	// full error.
 	BlockedReason string
 	Err           error
 }
 
 const (
-	BlockedDirtyBehind = "dirty-working-tree"
-	BlockedDiverged    = "diverged-history"
-	BlockedOperation   = "operation-in-progress"
+	BlockedDirtyTree = "dirty-working-tree"
+	BlockedDiverged  = "diverged-history"
+	BlockedOperation = "operation-in-progress"
 )
 
 // runPreCheckPhase runs the guard step that opens a sync cycle: is there a
@@ -133,7 +134,8 @@ func runIntegratePhase(git GitClient, repo config.Repository, hostname string, l
 }
 
 // runCommittedSyncPhase transports only commits that already exist. It never
-// stages or creates a commit and never merges divergent histories. A push is
+// stages or creates a commit; a divergence is integrated by replaying the
+// local commits onto upstream, never by authoring a merge commit. A push is
 // safe with a dirty working tree because it changes the remote ref, not the
 // checkout, and a fast-forward is left to git to accept or refuse.
 //
@@ -155,7 +157,7 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 		return
 	}
 	state := statemachine.Classify(ahead, behind)
-	result.Action = statemachine.ActionFor(state)
+	result.Action = statemachine.CommittedSyncActionFor(state)
 	logger.Info("classified committed-sync state", "state", state.String(), "ahead", ahead, "behind", behind)
 
 	switch state {
@@ -176,7 +178,7 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 		// is also atomic in a way a status check followed by a merge is not.
 		if err := git.MergeFF(upstream); err != nil {
 			if refusedOverUncommittedWork(git) {
-				result.BlockedReason = BlockedDirtyBehind
+				result.BlockedReason = BlockedDirtyTree
 				result.Err = fmt.Errorf("postponing fast-forward: %w", err)
 			} else {
 				result.Err = fmt.Errorf("fast-forward merge: %w", err)
@@ -185,20 +187,54 @@ func runCommittedSyncPhase(git GitClient, repo config.Repository, logger *slog.L
 		}
 
 	case statemachine.Diverged:
-		result.BlockedReason = BlockedDiverged
-		result.Err = fmt.Errorf("local and upstream histories diverged; manual merge required")
+		// Replaying the local commits is what keeps a divergence from
+		// parking the repository until someone notices: two machines
+		// committing to the same branch is the normal way a shared checkout
+		// diverges, and neither side's commits need a human to reconcile
+		// them. A rebase — rather than the merge the auto-commit workflow
+		// runs — is what committed-sync's contract allows, since it moves
+		// the user's own commits instead of authoring one of gitloop's. The
+		// rewrite is safe because Ahead commits are by definition unpushed.
+		conflict, err := git.Rebase(upstream)
+		if err != nil {
+			// A rebase, unlike a fast-forward, refuses any uncommitted
+			// change rather than only the ones in its way — so this is the
+			// refusal to expect on a shared checkout, labeled the same way.
+			if refusedOverUncommittedWork(git) {
+				result.BlockedReason = BlockedDirtyTree
+				result.Err = fmt.Errorf("postponing rebase: %w", err)
+			} else {
+				result.Err = fmt.Errorf("rebase: %w", err)
+			}
+			return
+		}
+		if conflict {
+			// Leaving the rebase paused would block every later cycle at
+			// PreCheck and hand the user a half-applied branch to reason
+			// about. Abort restores the pre-rebase state exactly, so the
+			// divergence is reported the way it was before gitloop tried.
+			if abortErr := git.RebaseAbort(); abortErr != nil {
+				result.Err = fmt.Errorf("rebase onto %s conflicted and could not be aborted: %w", upstream, abortErr)
+				return
+			}
+			result.BlockedReason = BlockedDiverged
+			result.Err = fmt.Errorf("replaying local commits onto %s stopped on a conflict; manual merge required", upstream)
+			return
+		}
+		needPush = true
 	}
 	return
 }
 
-// refusedOverUncommittedWork labels a refused fast-forward without parsing
-// git's localizable message. Uncommitted work is the refusal to expect here,
-// so a dirty tree earns the blocked status that tells the user what to do.
+// refusedOverUncommittedWork labels a refused fast-forward or rebase without
+// parsing git's localizable message. Uncommitted work is the refusal to expect
+// in both places, so a dirty tree earns the blocked status that tells the user
+// what to do.
 //
-// The attribution is a guess, not a diagnosis: the Behind classification is
-// already stale by the time the merge runs, so a human committing in between
-// produces a divergence that gets reported as a dirty tree. Only the label is
-// at stake — the git error saying what actually happened is kept either way.
+// The attribution is a guess, not a diagnosis: the classification is already
+// stale by the time the command runs, so a human committing in between turns
+// one refusal into another and gets reported as a dirty tree. Only the label
+// is at stake — the git error saying what actually happened is kept either way.
 func refusedOverUncommittedWork(git GitClient) bool {
 	// A status that won't even read is no basis for blaming the user's edits.
 	entries, err := git.StatusPorcelain()

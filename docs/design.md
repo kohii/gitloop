@@ -60,9 +60,36 @@ nested `workflow` tag. The three workflow contracts are:
   staging or creating a commit.
 
 `committed-sync` fetches on every cycle, pushes an ahead branch even when the
-working tree is dirty, fast-forwards whenever git is willing to, and refuses
-diverged histories. It never creates a merge commit: a human must resolve a
-divergence before gitloop can transport the resulting commits.
+working tree is dirty, fast-forwards whenever git is willing to, and resolves a
+divergence by replaying the local commits onto upstream. It never creates a
+commit — including a merge commit — so every commit it transports is one a
+person wrote.
+
+**Why a rebase is the divergence action here, when the auto-commit workflow
+merges.** A merge would satisfy "don't rewrite history" but violate the
+contract that matters more for this workflow: the merge commit would be one
+gitloop authored. A rebase inverts that trade — it writes no commit of its
+own, and what it rewrites are the local branch's Ahead commits, which are by
+definition unpushed, so nothing outside this checkout can be built on the
+versions being replaced. Git's patch-id check also drops commits already
+applied upstream, which is what makes the same edit committed on two machines
+converge instead of conflicting on every cycle.
+
+Blocking instead was the original behavior and turned out to be the wrong
+default: a shared dotfiles checkout diverges as a matter of course whenever two
+machines commit between fetches, and neither side's commits need a human to
+reconcile them. A repository that stops syncing until someone reads
+`gitloop status` is a worse failure than the one the block was guarding
+against.
+
+The pre-conditions are still git's to enforce. A rebase refuses to start over
+*any* uncommitted change (unlike `merge --ff-only`, which refuses only the
+paths in its way), so a dirty tree defers the replay with
+`blocked_reason: dirty-working-tree`. A replay that stops on a real conflict is
+aborted — restoring the branch and working tree exactly — and reported as
+`diverged-history`, the state it was in before gitloop tried. Leaving the
+rebase paused instead would trip `PreCheck` on every later cycle and hand the
+user a half-applied branch to reason about.
 
 ### Remote command lifetime
 
@@ -137,22 +164,23 @@ whichever cycle finds the tree clean.
 ## Sync state table
 
 After `git fetch`, `git rev-list --left-right --count <branch>...<remote>/<branch>`
-gives (ahead, behind), classified into 4 states with one action each:
+gives (ahead, behind), classified into 4 states with one action each. Only the
+Diverged row depends on the workflow:
 
-| ahead | behind | state    | action              |
-|------:|-------:|----------|---------------------|
-| 0     | 0      | Equal    | no-op               |
-| >0    | 0      | Ahead    | push                |
-| 0     | >0     | Behind   | fast-forward merge  |
-| >0    | >0     | Diverged | merge, then push    |
+| ahead | behind | state    | action (auto-commit-sync) | action (committed-sync) |
+|------:|-------:|----------|---------------------------|-------------------------|
+| 0     | 0      | Equal    | no-op                     | no-op                   |
+| >0    | 0      | Ahead    | push                      | push                    |
+| 0     | >0     | Behind   | fast-forward merge        | fast-forward merge      |
+| >0    | >0     | Diverged | merge, then push          | rebase, then push       |
 
 Before any of this runs, `statemachine.PreCheck` stats `.git/rebase-merge`,
 `.git/rebase-apply`, and `.git/MERGE_HEAD` (following the `gitdir:`
 indirection for worktrees). If any exist, the cycle is skipped entirely —
 gitloop never touches a repository that a human (or another tool) is in the
-middle of operating on. gitloop itself never leaves a rebase in progress
-(it doesn't use `git rebase` at all), so a rebase marker found here always
-means an external tool or a person started one by hand.
+middle of operating on. gitloop never *leaves* one of those markers behind
+either: the only rebase it runs is committed-sync's divergence replay, which
+is aborted in the same cycle if it stops on a conflict.
 
 Reusing the same cycle (guard -> fetch -> commit-if-dirty -> classify -> act)
 for all three triggers — settle timer, max-wait timer, and the periodic
@@ -178,21 +206,24 @@ working-tree changes the watcher missed.
 
 **Committed-sync repositories stop before the commit step.** They still fetch
 and classify the local branch, but only take these actions: no-op for Equal,
-push for Ahead, an attempted fast-forward for Behind, and a reported blocked
-state for a refused fast-forward or for Diverged. This mode is stricter than a
-generic `auto_commit: false` flag: it prevents a future integration policy
-from silently creating merge commits under a workflow whose contract is that
-commits are human-created.
+push for Ahead, an attempted fast-forward for Behind, an attempted rebase for
+Diverged, and a reported blocked state when git refuses either of the last two.
+This mode is stricter than a generic `auto_commit: false` flag: it keeps an
+integration policy from creating commits under a workflow whose contract is
+that commits are human-created.
 
 ## Conflict flow
 
-`Diverged` maps to `merge, then push`. gitloop never uses `git rebase` or
-`git reset --hard`: a vault-app contract this daemon must respect forbids
-rewriting history internally, and `reset --hard` in particular used to
-discard every local commit down to upstream on a conflict — including
-commits to files that had nothing to do with the conflict. A merge only
-ever touches the files it can't auto-resolve, so non-conflicting local
-commits are always preserved as part of the merge commit.
+This section is about the auto-commit workflow, where `Diverged` maps to
+`merge, then push`. It never uses `git rebase` or `git reset --hard`: a
+vault-app contract this daemon must respect forbids rewriting history under an
+auto-commit repository, and `reset --hard` in particular used to discard every
+local commit down to upstream on a conflict — including commits to files that
+had nothing to do with the conflict. A merge only ever touches the files it
+can't auto-resolve, so non-conflicting local commits are always preserved as
+part of the merge commit. (Committed-sync does rebase, and has no conflict
+policy at all: see "Workflow contracts" for why the trade lands the other way
+when every commit is human-authored.)
 
 `git merge --no-ff --no-edit <upstream>` either fast-forwards (never
 actually reachable here, since Diverged means neither side is an ancestor
@@ -391,8 +422,8 @@ handshake:
        via `defer` in addition to being called explicitly at the end of
        the phase, so a panic inside a merge or conflict-resolution step
        can't leak the flock and deadlock every subsequent cycle.
-       In `committed-sync`, this phase only attempts a fast-forward; it
-       never stages, commits, or merges.
+       In `committed-sync`, this phase only attempts a fast-forward or a
+       rebase; it never stages, commits, or merges.
     3. **Push (lock released)**: push if the state was Ahead or Diverged.
        Like fetch, this is network I/O that doesn't touch the working
        tree; holding the lock across a slow push would just delay the

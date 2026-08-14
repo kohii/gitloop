@@ -55,7 +55,7 @@ defaults:
   save_lock_path: ""   # "" (default) disables save-lock coordination
 ```
 
-For repositories where commits must always be made by a person, use an
+For repositories where every commit must be one a person wrote, use an
 explicit workflow. `committed-sync` never stages or creates a commit:
 
 ```yaml
@@ -212,7 +212,7 @@ from syncing.
 `workflow.type: committed-sync` is for repositories such as a shared dotfiles
 checkout where people make commits explicitly, while gitloop transports those
 commits between machines. It never runs `git add`, `git commit`, `git stash`,
-`git reset`, or an automatic merge.
+`git reset`, or a merge that would create a commit of its own.
 
 Each cycle fetches the remote and classifies the checked-out branch:
 
@@ -222,14 +222,25 @@ Each cycle fetches the remote and classifies the checked-out branch:
 | clean or dirty | ahead | push existing commits |
 | clean, or dirty outside the incoming commits | behind | fast-forward |
 | dirty in a file the incoming commits rewrite | behind | defer and report `dirty-working-tree` |
-| clean or dirty | diverged | defer and report `diverged-history` |
+| clean | diverged | replay the local commits onto upstream, then push |
+| dirty | diverged | defer and report `dirty-working-tree` |
+| clean | diverged, and the replay conflicts | abort it and report `diverged-history` |
 
 Fetching and pushing existing commits are safe while files are being edited,
 and so is a fast-forward that rewrites none of them. gitloop just runs
 `git merge --ff-only` and lets Git refuse — leaving the checkout untouched —
 when the update would overwrite modified or untracked content, so editing one
-file doesn't hold the whole repository behind upstream. Divergent histories
-are left for a human to merge or rebase.
+file doesn't hold the whole repository behind upstream.
+
+A divergence — two machines each committing to the same branch — is resolved
+with `git rebase`, which replays your local commits on top of upstream. That
+keeps every commit in the repository one a person wrote, since gitloop
+authors no merge commit, and the commits it rewrites are unpushed ones nothing
+else can be built on. The same edit committed on two machines is dropped by
+Git's own patch-id check rather than turning into a conflict. A rebase needs a
+clean working tree, so uncommitted changes defer it; a replay that hits a real
+conflict is aborted, restoring the branch exactly as it was, and left for a
+human.
 
 One thing this does not protect: a file you keep locally but `.gitignore` is
 overwritten without warning if the remote starts tracking that path, because
@@ -244,7 +255,10 @@ final guard but there is no coordination handshake.
 
 ## Conflict resolution
 
-If a merge stops on a real conflict, `on_conflict` decides what happens:
+If a merge stops on a real conflict, `on_conflict` decides what happens. This
+applies to auto-commit repositories only: `committed-sync` has no
+conflict policy, because it never completes a conflicted integration — it
+aborts the replay and reports `diverged-history` instead.
 
 - **`backup`** (default): saves both sides of each conflicted file next to
   the original, e.g. `notes/todo.conflict.macbook-air.20260707153000.ours.md`

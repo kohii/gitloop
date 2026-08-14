@@ -43,6 +43,10 @@ func (f *fakeConflictGit) RevListLeftRightCount(string, string) (int, int, error
 func (f *fakeConflictGit) MergeFF(string) error       { return nil }
 func (f *fakeConflictGit) Merge(string) (bool, error) { return true, nil }
 func (f *fakeConflictGit) MergeAbort() error          { f.mergeAbortCalled = true; return nil }
+func (f *fakeConflictGit) Rebase(string) (bool, error) {
+	panic("the conflict-resolution path must not run a rebase")
+}
+func (f *fakeConflictGit) RebaseAbort() error { panic("no rebase to abort") }
 func (f *fakeConflictGit) CheckoutTheirs(p string) error {
 	f.checkedOutTheirs = append(f.checkedOutTheirs, p)
 	return nil

@@ -22,6 +22,28 @@ func TestActionFor(t *testing.T) {
 	}
 }
 
+func TestCommittedSyncActionFor(t *testing.T) {
+	cases := []struct {
+		state RelativeState
+		want  Action
+	}{
+		{Equal, NoOp},
+		{Ahead, Push},
+		{Behind, FastForwardMerge},
+		// A merge commit would be one gitloop authored itself, which the
+		// workflow's contract forbids; replaying the local commits does not.
+		{Diverged, RebaseThenPush},
+	}
+
+	for _, c := range cases {
+		t.Run(c.state.String(), func(t *testing.T) {
+			if got := CommittedSyncActionFor(c.state); got != c.want {
+				t.Errorf("CommittedSyncActionFor(%v) = %v, want %v", c.state, got, c.want)
+			}
+		})
+	}
+}
+
 func TestActionString(t *testing.T) {
 	cases := []struct {
 		action Action
@@ -31,6 +53,7 @@ func TestActionString(t *testing.T) {
 		{Push, "push"},
 		{FastForwardMerge, "fast-forward-merge"},
 		{MergeThenPush, "merge-then-push"},
+		{RebaseThenPush, "rebase-then-push"},
 		{Action(99), "unknown"},
 	}
 

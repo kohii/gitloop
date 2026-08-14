@@ -305,6 +305,203 @@ func TestMergeReportsConflict(t *testing.T) {
 	}
 }
 
+// divergedRepo builds a repository whose main branch and local "upstream"
+// branch have each added a commit on top of a shared base. Upstream always
+// rewrites a.md; the local commit writes localContent to localFile, so callers
+// pick whether the two sides collide.
+func divergedRepo(t *testing.T, dir, localFile, localContent, upstreamContent string) *Runner {
+	t.Helper()
+	r := initRepo(t, dir)
+	writeFile(t, dir, "a.md", "base\n")
+	writeFile(t, dir, "b.md", "b base\n")
+	if err := r.AddAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Commit("base"); err != nil {
+		t.Fatal(err)
+	}
+
+	runIn(t, dir, "checkout", "-q", "-b", "upstream")
+	writeFile(t, dir, "a.md", upstreamContent)
+	runIn(t, dir, "add", "-A")
+	runIn(t, dir, "commit", "-q", "-m", "upstream change")
+
+	runIn(t, dir, "checkout", "-q", "main")
+	writeFile(t, dir, localFile, localContent)
+	runIn(t, dir, "add", "-A")
+	runIn(t, dir, "commit", "-q", "-m", "local change")
+	return r
+}
+
+func TestRebaseReplaysLocalCommitsOntoUpstream(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	// The local commit rewrites b.md while upstream rewrote a.md, so the
+	// replay is clean.
+	r := divergedRepo(t, dir, "b.md", "b local\n", "upstream\n")
+
+	conflict, err := r.Rebase("upstream")
+	if err != nil {
+		t.Fatalf("Rebase: %v", err)
+	}
+	if conflict {
+		t.Fatal("Rebase() conflict = true, want a clean replay")
+	}
+
+	ahead, behind, err := r.RevListLeftRightCount("main", "upstream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if behind != 0 {
+		t.Errorf("main is %d commits behind upstream after a rebase, want 0", behind)
+	}
+	if ahead == 0 {
+		t.Error("rebase dropped the local commits entirely")
+	}
+	if got := strings.TrimSpace(runOut(t, dir, "rev-list", "--merges", "upstream..main")); got != "" {
+		t.Errorf("rebase produced merge commits (%s), want a linear history", got)
+	}
+}
+
+// TestRebaseDropsCommitsAlreadyUpstream covers the everyday shape of a shared
+// dotfiles checkout: the same edit was committed on two machines. Git's own
+// patch-id check drops the duplicate, so what would be a conflict on every
+// cycle converges instead.
+func TestRebaseDropsCommitsAlreadyUpstream(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := divergedRepo(t, dir, "a.md", "same edit\n", "same edit\n")
+
+	conflict, err := r.Rebase("upstream")
+	if err != nil {
+		t.Fatalf("Rebase: %v", err)
+	}
+	if conflict {
+		t.Fatal("Rebase() conflict = true, want the duplicate commit dropped")
+	}
+
+	ahead, behind, err := r.RevListLeftRightCount("main", "upstream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ahead != 0 || behind != 0 {
+		t.Errorf("RevListLeftRightCount = (%d, %d), want (0, 0): main should now equal upstream", ahead, behind)
+	}
+}
+
+func TestRebaseReportsConflictAndAbortRestoresTheBranch(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := divergedRepo(t, dir, "a.md", "local\n", "upstream\n")
+	before := strings.TrimSpace(runOut(t, dir, "rev-parse", "main"))
+
+	conflict, err := r.Rebase("upstream")
+	if err != nil {
+		t.Fatalf("Rebase: %v", err)
+	}
+	if !conflict {
+		t.Fatal("Rebase() conflict = false, want true")
+	}
+
+	if err := r.RebaseAbort(); err != nil {
+		t.Fatalf("RebaseAbort: %v", err)
+	}
+	if got := strings.TrimSpace(runOut(t, dir, "rev-parse", "main")); got != before {
+		t.Errorf("main = %s after abort, want the pre-rebase %s", got, before)
+	}
+	entries, err := r.StatusPorcelain()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("StatusPorcelain after RebaseAbort = %#v, want clean", entries)
+	}
+}
+
+// TestRebaseRefusesUncommittedChanges is what makes the daemon's
+// dirty-working-tree block honest: git turns the rebase down before starting
+// it, leaving nothing to abort.
+func TestRebaseRefusesUncommittedChanges(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := divergedRepo(t, dir, "a.md", "local\n", "upstream\n")
+	writeFile(t, dir, "b.md", "uncommitted\n")
+
+	conflict, err := r.Rebase("upstream")
+	if err == nil {
+		t.Fatal("Rebase() = nil, want a refusal over uncommitted changes")
+	}
+	if conflict {
+		t.Error("Rebase() conflict = true, want false: the rebase never started")
+	}
+	if got := readFile(t, dir, "b.md"); got != "uncommitted\n" {
+		t.Errorf("b.md = %q, want the uncommitted content left alone", got)
+	}
+}
+
+// TestRebaseIgnoresConfiguredAutostash guards that refusal against a user's
+// own git config, for the same reason MergeFF suppresses merge.autostash: an
+// autostash turns "declined, nothing touched" into a replay whose unstash can
+// fail, leaving conflict markers in the tree and the user's work in a stash.
+func TestRebaseIgnoresConfiguredAutostash(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := divergedRepo(t, dir, "a.md", "local\n", "upstream\n")
+	runIn(t, dir, "config", "rebase.autostash", "true")
+	writeFile(t, dir, "b.md", "uncommitted\n")
+
+	if _, err := r.Rebase("upstream"); err == nil {
+		t.Fatal("Rebase() = nil, want the refusal to survive rebase.autostash")
+	}
+	if got := readFile(t, dir, "b.md"); got != "uncommitted\n" {
+		t.Errorf("b.md = %q, want the uncommitted content left alone", got)
+	}
+	if got := strings.TrimSpace(runOut(t, dir, "stash", "list")); got != "" {
+		t.Errorf("stash list = %q, want no stash entry left behind", got)
+	}
+}
+
+// TestPausedOperationsAreDetectedInALinkedWorktree pins that a paused merge or
+// rebase is recognized where .git is a file pointing elsewhere. Assuming
+// `<dir>/.git/MERGE_HEAD` would report every conflict in a linked worktree as
+// a failed git invocation instead.
+func TestPausedOperationsAreDetectedInALinkedWorktree(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	divergedRepo(t, dir, "a.md", "local\n", "upstream\n")
+	linked := filepath.Join(t.TempDir(), "linked")
+	runIn(t, dir, "worktree", "add", "-q", "-b", "linked-main", linked, "main")
+	r := New(linked)
+
+	conflict, err := r.Rebase("upstream")
+	if err != nil {
+		t.Fatalf("Rebase in a linked worktree: %v", err)
+	}
+	if !conflict {
+		t.Fatal("Rebase() conflict = false, want true")
+	}
+	if err := r.RebaseAbort(); err != nil {
+		t.Fatalf("RebaseAbort: %v", err)
+	}
+
+	conflict, err = r.Merge("upstream")
+	if err != nil {
+		t.Fatalf("Merge in a linked worktree: %v", err)
+	}
+	if !conflict {
+		t.Fatal("Merge() conflict = false, want true")
+	}
+	if err := r.MergeAbort(); err != nil {
+		t.Fatalf("MergeAbort: %v", err)
+	}
+}
+
 // TestShowStageAppliesSmudgeFilter guards against regressing to a plain
 // `git show :N:<path>`, which reads the raw stored blob and bypasses the
 // path's clean/smudge filters. That is a fatal shape for git-crypt users:

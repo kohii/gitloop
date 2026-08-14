@@ -18,9 +18,17 @@ type committedSyncFakeGit struct {
 	// ffErr stands in for git's refusal to fast-forward. Real git only
 	// refuses when checking out the incoming tree would overwrite something,
 	// so a fake that fails while dirty models a genuine collision.
-	ffErr     error
-	ffCount   int
-	pushCount int
+	ffErr   error
+	ffCount int
+	// rebaseConflict and rebaseErr stand in for the two ways git declines to
+	// replay local commits: stopping on a conflict mid-replay, and refusing to
+	// start at all (a dirty working tree being the case to expect).
+	rebaseConflict   bool
+	rebaseErr        error
+	abortErr         error
+	rebaseCount      int
+	rebaseAbortCount int
+	pushCount        int
 }
 
 type checkedOutBranchFakeGit struct {
@@ -48,6 +56,19 @@ func (f *committedSyncFakeGit) Merge(string) (bool, error) {
 	panic("committed-sync must not run a merge")
 }
 
+func (f *committedSyncFakeGit) Rebase(string) (bool, error) {
+	if f.rebaseErr != nil {
+		return false, f.rebaseErr
+	}
+	f.rebaseCount++
+	return f.rebaseConflict, nil
+}
+
+func (f *committedSyncFakeGit) RebaseAbort() error {
+	f.rebaseAbortCount++
+	return f.abortErr
+}
+
 func (f *committedSyncFakeGit) Push(context.Context, string, string) error {
 	f.pushCount++
 	return nil
@@ -72,8 +93,8 @@ func TestRunCommittedSyncPhaseNeverCommitsDirtyChanges(t *testing.T) {
 
 	result, _, needPush := runCommittedSyncPhase(git, committedSyncRepo(), logger)
 
-	if result.BlockedReason != BlockedDirtyBehind {
-		t.Errorf("BlockedReason = %q, want %q", result.BlockedReason, BlockedDirtyBehind)
+	if result.BlockedReason != BlockedDirtyTree {
+		t.Errorf("BlockedReason = %q, want %q", result.BlockedReason, BlockedDirtyTree)
 	}
 	if result.Err == nil {
 		t.Fatal("Err = nil, want dirty working tree error")
@@ -148,17 +169,92 @@ func TestRunCommittedSyncPhaseLeavesACleanTreeRefusalUnclassified(t *testing.T) 
 	}
 }
 
-func TestRunCommittedSyncPhaseRefusesDivergedHistory(t *testing.T) {
+// TestRunCommittedSyncPhaseRebasesDivergedHistory pins the resolution a shared
+// checkout needs: two machines committing to one branch is ordinary, so the
+// local commits are replayed onto upstream and pushed rather than parking the
+// repository until a human notices.
+func TestRunCommittedSyncPhaseRebasesDivergedHistory(t *testing.T) {
 	git := &committedSyncFakeGit{fakeGit: &fakeGit{}, ahead: 1, behind: 1}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	result, branch, needPush := runCommittedSyncPhase(git, committedSyncRepo(), logger)
+
+	if result.Err != nil || result.BlockedReason != "" {
+		t.Fatalf("diverged result = err:%v reason:%q, want nil/empty", result.Err, result.BlockedReason)
+	}
+	if git.rebaseCount != 1 || branch != "main" || !needPush {
+		t.Errorf("diverged result = rebases:%d branch:%q needPush:%v, want 1/main/true", git.rebaseCount, branch, needPush)
+	}
+	if git.commitCount() != 0 || git.ffCount != 0 || git.rebaseAbortCount != 0 {
+		t.Errorf("phase overreached: commits=%d ff=%d aborts=%d", git.commitCount(), git.ffCount, git.rebaseAbortCount)
+	}
+}
+
+// TestRunCommittedSyncPhaseAbortsAConflictingRebase keeps a failed replay from
+// leaving the repository worse off than the divergence it tried to resolve: a
+// paused rebase would block every later cycle at PreCheck.
+func TestRunCommittedSyncPhaseAbortsAConflictingRebase(t *testing.T) {
+	git := &committedSyncFakeGit{fakeGit: &fakeGit{}, ahead: 1, behind: 1, rebaseConflict: true}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	result, _, needPush := runCommittedSyncPhase(git, committedSyncRepo(), logger)
 
 	if result.BlockedReason != BlockedDiverged || result.Err == nil {
-		t.Errorf("diverged result = reason:%q err:%v, want blocked error", result.BlockedReason, result.Err)
+		t.Errorf("conflicting rebase result = reason:%q err:%v, want blocked error", result.BlockedReason, result.Err)
 	}
-	if needPush || git.ffCount != 0 || git.pushCount != 0 || git.commitCount() != 0 {
-		t.Errorf("diverged phase mutated repository: needPush=%v ff=%d push=%d commits=%d", needPush, git.ffCount, git.pushCount, git.commitCount())
+	if git.rebaseAbortCount != 1 {
+		t.Errorf("rebaseAbortCount = %d, want 1", git.rebaseAbortCount)
+	}
+	if needPush || git.pushCount != 0 || git.commitCount() != 0 {
+		t.Errorf("conflicting rebase mutated repository: needPush=%v push=%d commits=%d", needPush, git.pushCount, git.commitCount())
+	}
+}
+
+// TestRunCommittedSyncPhaseReportsAFailedRebaseAbort surfaces the one state
+// gitloop cannot clean up after itself, rather than reporting the divergence
+// as if the checkout were back where it started.
+func TestRunCommittedSyncPhaseReportsAFailedRebaseAbort(t *testing.T) {
+	git := &committedSyncFakeGit{
+		fakeGit:        &fakeGit{},
+		ahead:          1,
+		behind:         1,
+		rebaseConflict: true,
+		abortErr:       errors.New("could not restore HEAD"),
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	result, _, needPush := runCommittedSyncPhase(git, committedSyncRepo(), logger)
+
+	if result.Err == nil {
+		t.Fatal("Err = nil, want the failed abort surfaced")
+	}
+	if result.BlockedReason != "" {
+		t.Errorf("BlockedReason = %q, want empty: this is a failure, not a deliberate block", result.BlockedReason)
+	}
+	if needPush || git.pushCount != 0 {
+		t.Errorf("failed abort still pushed: needPush=%v push=%d", needPush, git.pushCount)
+	}
+}
+
+// TestRunCommittedSyncPhaseDefersARebaseOverUncommittedWork covers the refusal
+// a rebase makes that a fast-forward does not: git declines any uncommitted
+// change, not only the ones the incoming commits would overwrite.
+func TestRunCommittedSyncPhaseDefersARebaseOverUncommittedWork(t *testing.T) {
+	git := &committedSyncFakeGit{
+		fakeGit:   &fakeGit{dirty: true},
+		ahead:     1,
+		behind:    1,
+		rebaseErr: errors.New("cannot rebase: You have unstaged changes"),
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	result, _, needPush := runCommittedSyncPhase(git, committedSyncRepo(), logger)
+
+	if result.BlockedReason != BlockedDirtyTree || result.Err == nil {
+		t.Errorf("dirty diverged result = reason:%q err:%v, want %q with an error", result.BlockedReason, result.Err, BlockedDirtyTree)
+	}
+	if needPush || git.pushCount != 0 || git.rebaseAbortCount != 0 || git.commitCount() != 0 {
+		t.Errorf("refused rebase mutated repository: needPush=%v push=%d aborts=%d commits=%d", needPush, git.pushCount, git.rebaseAbortCount, git.commitCount())
 	}
 }
 

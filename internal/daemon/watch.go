@@ -173,12 +173,15 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			}
 			if err != nil {
 				err = annotateRemoteError(err, repo.RemoteTimeout)
-				// Preserve the "why are we pushing" context — a push after a
-				// merge commit vs. a bare push of local-only commits are
+				// Preserve the "why are we pushing" context — a push after an
+				// integration vs. a bare push of local-only commits are
 				// meaningfully different failures at debug time.
-				if result.Action == statemachine.MergeThenPush {
+				switch result.Action {
+				case statemachine.MergeThenPush:
 					result.Err = fmt.Errorf("push after merge: %w", err)
-				} else {
+				case statemachine.RebaseThenPush:
+					result.Err = fmt.Errorf("push after rebase: %w", err)
+				default:
 					result.Err = fmt.Errorf("push: %w", err)
 				}
 			} else {
