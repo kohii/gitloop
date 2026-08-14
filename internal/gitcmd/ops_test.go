@@ -1,6 +1,7 @@
 package gitcmd
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -125,7 +126,7 @@ func TestFetchAndRevListLeftRightCount(t *testing.T) {
 	runIn(t, otherDir, "commit", "-q", "-m", "other change")
 	runIn(t, otherDir, "push", "-q", "origin", "main")
 
-	if err := local.Fetch("origin"); err != nil {
+	if err := local.Fetch(context.Background(), "origin"); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 	ahead, behind, err := local.RevListLeftRightCount("main", "origin/main")

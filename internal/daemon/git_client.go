@@ -1,6 +1,10 @@
 package daemon
 
-import "github.com/kohii/gitloop/internal/gitcmd"
+import (
+	"context"
+
+	"github.com/kohii/gitloop/internal/gitcmd"
+)
 
 // GitClient is the subset of gitcmd.Runner's behavior a repository's sync
 // loop needs. It exists so tests can drive the loop against a fake instead
@@ -11,14 +15,14 @@ type GitClient interface {
 	AddPath(path string) error
 	Commit(message string) error
 	RemoteNames() ([]string, error)
-	Fetch(remote string) error
+	Fetch(ctx context.Context, remote string) error
 	CurrentBranch() (string, error)
 	RevListLeftRightCount(local, upstream string) (ahead, behind int, err error)
 	MergeFF(upstream string) error
 	Merge(upstream string) (conflict bool, err error)
 	MergeAbort() error
 	CheckoutTheirs(path string) error
-	Push(remote, branch string) error
+	Push(ctx context.Context, remote, branch string) error
 	ConflictedFiles() ([]string, error)
 	ShowStage(stage int, path string) (content string, ok bool, err error)
 }

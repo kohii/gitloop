@@ -29,6 +29,7 @@ repositories:
 		Settle:        3 * time.Second,
 		MaxWait:       60 * time.Second,
 		FetchInterval: 30 * time.Second,
+		RemoteTimeout: 10 * time.Minute,
 		Mode:          ModeSync,
 		Workflow:      WorkflowAutoCommitSync,
 		Remote:        "origin",
@@ -52,6 +53,7 @@ defaults:
   settle: 3s
   max_wait: 60s
   fetch_interval: 5m
+  remote_timeout: 8m
   remote: origin
   branch: ""
   on_conflict: claude
@@ -67,6 +69,9 @@ defaults:
 	first := cfg.Repositories[0]
 	if first.Settle != 3*time.Second || first.OnConflict != OnConflictClaude {
 		t.Errorf("Repositories[0] = %+v, want defaults applied", first)
+	}
+	if first.RemoteTimeout != 8*time.Minute {
+		t.Errorf("Repositories[0].RemoteTimeout = %v, want 8m from defaults", first.RemoteTimeout)
 	}
 	if first.ModeWasExplicitlySet() {
 		t.Error("Repositories[0].ModeWasExplicitlySet() = true, want false without a mode setting")
@@ -266,6 +271,7 @@ repositories:
       remote: origin
       branch: main
       interval: 1m
+      remote_timeout: 4m
 `)
 	cfg, err := Parse(yaml)
 	if err != nil {
@@ -278,8 +284,8 @@ repositories:
 	if !repo.WorkflowWasExplicitlySet() {
 		t.Error("WorkflowWasExplicitlySet() = false, want true for nested workflow")
 	}
-	if repo.Remote != "origin" || repo.Branch != "main" || repo.FetchInterval != time.Minute {
-		t.Errorf("repository overrides = %+v, want origin/main/1m", repo)
+	if repo.Remote != "origin" || repo.Branch != "main" || repo.FetchInterval != time.Minute || repo.RemoteTimeout != 4*time.Minute {
+		t.Errorf("repository overrides = %+v, want origin/main/1m/4m", repo)
 	}
 	if repo.AutoCommits() {
 		t.Error("committed-sync AutoCommits() = true, want false")
@@ -313,6 +319,17 @@ func TestParseWorkflowRejectsInvalidCombinations(t *testing.T) {
     workflow:
       type: auto-commit-only
       remote: origin
+`,
+		"auto-commit-only remote timeout": `repositories:
+  - path: ~/journal
+    workflow:
+      type: auto-commit-only
+      remote_timeout: 1m
+`,
+		"legacy commit-only remote timeout": `repositories:
+  - path: ~/journal
+    mode: commit-only
+    remote_timeout: 1m
 `,
 		"duplicate conflict policy": `repositories:
   - path: ~/notes
@@ -371,7 +388,7 @@ func TestSyncsRemote(t *testing.T) {
 // recover into an endlessly retried failure with that repository never
 // actually watched. A startup error is the visible failure instead.
 func TestParseRejectsNonPositiveDurations(t *testing.T) {
-	for _, field := range []string{"settle", "max_wait", "fetch_interval"} {
+	for _, field := range []string{"settle", "max_wait", "fetch_interval", "remote_timeout"} {
 		for _, value := range []string{"0s", "-1s"} {
 			t.Run(field+"="+value, func(t *testing.T) {
 				yaml := []byte("repositories:\n  - path: ~/notes\n    " + field + ": " + value + "\n")

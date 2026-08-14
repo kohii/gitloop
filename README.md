@@ -47,6 +47,7 @@ defaults:
   settle: 3s           # debounce: commit `settle` after the last file change
   max_wait: 60s        # ...but never wait longer than this while changes keep arriving
   fetch_interval: 30s  # also fetch on a timer, to notice remote-only changes
+  remote_timeout: 10m  # hard deadline for each fetch or push
   mode: sync           # optional: "sync" or "commit-only"
   remote: origin
   branch: ""           # empty = whatever is currently checked out
@@ -74,6 +75,12 @@ is also accepted as a legacy alias. A nested `workflow` cannot be combined
 with `mode`.
 Workflow-specific fields that do not apply to the selected type are rejected
 at startup.
+
+Remote-backed repositories accept `remote_timeout` at the repository,
+`defaults`, or nested `workflow` level. The deadline applies separately to
+each fetch and push. A timeout terminates Git and its transport children;
+local commit and merge commands are not interrupted because doing so could
+leave the index or working tree half-mutated.
 
 `~` in `path` is expanded to the user's home directory.
 

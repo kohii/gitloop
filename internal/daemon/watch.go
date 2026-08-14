@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -74,8 +75,14 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		// fresh upstream data to classify against.
 		var fetchErr error
 		if syncsRemote {
-			if err := git.Fetch(repo.Remote); err != nil {
-				fetchErr = fmt.Errorf("fetch: %w", err)
+			remoteCtx, cancel := remoteCommandContext(ctx, repo.RemoteTimeout)
+			err := git.Fetch(remoteCtx, repo.Remote)
+			cancel()
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				fetchErr = fmt.Errorf("fetch: %w", annotateRemoteError(err, repo.RemoteTimeout))
 				if repo.AutoCommits() {
 					// Not called a "commit-only cycle": that names a configured
 					// mode, and this is a transient failure in a repo that syncs.
@@ -152,7 +159,14 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 		// Push is network I/O, run outside the lock so an external writer
 		// isn't blocked on a slow remote.
 		if result.Err == nil && needPush {
-			if err := git.Push(repo.Remote, branch); err != nil {
+			remoteCtx, cancel := remoteCommandContext(ctx, repo.RemoteTimeout)
+			err := git.Push(remoteCtx, repo.Remote, branch)
+			cancel()
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				err = annotateRemoteError(err, repo.RemoteTimeout)
 				// Preserve the "why are we pushing" context — a push after a
 				// merge commit vs. a bare push of local-only commits are
 				// meaningfully different failures at debug time.
@@ -240,6 +254,25 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			runCycle("fetch-interval")
 		}
 	}
+}
+
+// remoteCommandContext applies the repository's network-operation policy
+// while preserving cancellation from daemon shutdown. A zero timeout is
+// accepted for hand-built Repository values in tests and means parent-only
+// cancellation; parsed production configuration always supplies a positive
+// timeout.
+func remoteCommandContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func annotateRemoteError(err error, timeout time.Duration) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("timed out after %s: %w", timeout, err)
+	}
+	return err
 }
 
 // resolveRepositoryMode turns the legacy omitted mode into commit-only when

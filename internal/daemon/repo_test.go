@@ -48,7 +48,7 @@ func (f *committedSyncFakeGit) Merge(string) (bool, error) {
 	panic("committed-sync must not run a merge")
 }
 
-func (f *committedSyncFakeGit) Push(string, string) error {
+func (f *committedSyncFakeGit) Push(context.Context, string, string) error {
 	f.pushCount++
 	return nil
 }
@@ -184,8 +184,8 @@ type committedSyncLoopFakeGit struct {
 	pushed chan struct{}
 }
 
-func (f *committedSyncLoopFakeGit) Push(remote, branch string) error {
-	if err := f.committedSyncFakeGit.Push(remote, branch); err != nil {
+func (f *committedSyncLoopFakeGit) Push(ctx context.Context, remote, branch string) error {
+	if err := f.committedSyncFakeGit.Push(ctx, remote, branch); err != nil {
 		return err
 	}
 	select {
