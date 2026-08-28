@@ -107,10 +107,20 @@ func TestRemoteCancellationRacePreservesSuccessfulExit(t *testing.T) {
 	dir := t.TempDir()
 	pidPath := filepath.Join(dir, "command.pid")
 	executable := filepath.Join(t.TempDir(), "term-success-command")
+	// The command must exit 0 promptly on SIGTERM, so it waits on a background
+	// child rather than looping over a foreground `sleep`: a shell defers a
+	// trap until the foreground child it is waiting for is reaped, and a
+	// `sleep` still between fork and exec swallows the process group's SIGTERM
+	// instead of dying from it. That combination delays the trap by the full
+	// sleep — long past the termination grace below — so the process would be
+	// killed rather than exit 0, and this test would measure the grace timer
+	// instead of the race it is here for. `wait` has no such problem: POSIX
+	// requires a caught signal to interrupt it.
 	script := `#!/bin/sh
-echo $$ > "` + pidPath + `"
 trap 'exit 0' TERM
-while :; do sleep 1; done
+sleep 60 >/dev/null 2>&1 &
+echo $$ > "` + pidPath + `"
+wait
 `
 	if err := os.WriteFile(executable, []byte(script), 0o755); err != nil {
 		t.Fatalf("write TERM-success command: %v", err)
