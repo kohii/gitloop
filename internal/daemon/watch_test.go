@@ -1049,6 +1049,127 @@ func TestRunRepoLoopReleasesSaveLockAfterCommitPhasePanic(t *testing.T) {
 	}
 }
 
+// TestRunRepoLoopWithNothingToDoNeverAsksForTheSaveLock pins the reason the
+// cycle looks before it locks. The save lock is held for this test's whole
+// duration by a stand-in for an external writer, so a cycle that asked for it
+// would be skipped and say so. Timer ticks over a clean, in-sync repository
+// must instead complete as ordinary successes — otherwise every process
+// sharing a checkout would pay the fetch interval in lost writing time.
+func TestRunRepoLoopWithNothingToDoNeverAsksForTheSaveLock(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "save.lock")
+	holder := openAndFlock(t, lockPath)
+	defer func() { holder.Close() }()
+
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        10 * time.Millisecond,
+		MaxWait:       2 * time.Second,
+		FetchInterval: 20 * time.Millisecond,
+		Mode:          config.ModeSync,
+		Remote:        "origin",
+		Branch:        "main",
+		OnConflict:    config.OnConflictBackup,
+		SaveLockPath:  lockPath,
+	}
+
+	git := &fakeGit{} // never dirty, and RevListLeftRightCount reports Equal
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	statusPath := filepath.Join(dir, "status.json")
+	recorder, err := newStatusRecorder(statusPath)
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+
+	waitFor(t, 2*time.Second, func() bool {
+		sf, err := LoadStatusFile(statusPath)
+		return err == nil && !sf.Repos[dir].LastSuccessfulSyncAt.IsZero()
+	})
+
+	sf, err := LoadStatusFile(statusPath)
+	if err != nil {
+		t.Fatalf("LoadStatusFile: %v", err)
+	}
+	if got := sf.Repos[dir].LastError; got != "" {
+		t.Errorf("last error = %q, want empty: a cycle with no work must not contend for the save lock", got)
+	}
+	if got := sf.Repos[dir].Phase; got != PhaseIdle {
+		t.Errorf("phase = %q, want %q", got, PhaseIdle)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down within 2s of context cancellation")
+	}
+}
+
+// TestRunRepoLoopPushesWhileTheSaveLockIsHeldElsewhere pins the other half of
+// the same idea: a push changes the remote, not the checkout, so commits that
+// already exist locally still reach the remote while an external writer is
+// mid-save.
+func TestRunRepoLoopPushesWhileTheSaveLockIsHeldElsewhere(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "save.lock")
+	holder := openAndFlock(t, lockPath)
+	defer func() { holder.Close() }()
+
+	pushed := make(chan struct{}, 1)
+	git := &aheadPushObserverFakeGit{
+		fakeGit: &fakeGit{}, // clean tree, so the push is the cycle's only work
+		onPush: func() {
+			select {
+			case pushed <- struct{}{}:
+			default:
+			}
+		},
+	}
+
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        10 * time.Millisecond,
+		MaxWait:       2 * time.Second,
+		FetchInterval: 20 * time.Millisecond,
+		Mode:          config.ModeSync,
+		Remote:        "origin",
+		Branch:        "main",
+		OnConflict:    config.OnConflictBackup,
+		SaveLockPath:  lockPath,
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(filepath.Join(dir, "status.json"))
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+
+	select {
+	case <-pushed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("push never ran while the save lock was held elsewhere")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down within 2s of context cancellation")
+	}
+}
+
 // aheadPushObserverFakeGit reports the local branch as Ahead so runCycle
 // takes the push path, and lets a test observe the exact moment Push is
 // called (to check surrounding state like status.json's phase).
