@@ -6,11 +6,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/kohii/gitloop/internal/commitmsg"
 	"github.com/kohii/gitloop/internal/config"
+)
+
+// Index stages of an unmerged path. Stage 1 (the common ancestor) is never
+// read: a backup is only worth writing for a side someone actually authored.
+const (
+	ourStage   = 2
+	theirStage = 3
 )
 
 // resolveConflicts is called after git.Merge reports a conflict. A merge
@@ -183,30 +191,79 @@ func readConflictMarkers(path string) (hasMarkers, readOK bool) {
 // into a backup file for the user to reconcile by hand instead. Nothing is
 // lost: both sides' content is preserved in the backup files, and the
 // commit that created the local side remains reachable from git history.
+//
+// "Accepting upstream" means checking out their version — or, when upstream
+// deleted the file, deleting it. Both settle the conflict; what must not
+// happen is leaving the merge unfinished with backup files on disk, because
+// `merge --abort` does not remove untracked files: the next cycle commits
+// them, hits the identical conflict, and writes another set under a fresh
+// timestamp, growing the pile once per cycle while the branch stays diverged
+// forever. Every bail-out therefore deletes the backups it wrote (see
+// abortCycle), so a retry starts from the same state this cycle did instead
+// of carrying its leftovers.
 func backupAndAcceptTheirs(git GitClient, repoPath, upstream string, files []string, hostname string, logger *slog.Logger) bool {
 	ts := time.Now().Format("20060102150405")
+	var written []string
 
 	for _, f := range files {
-		oursSaved := backupStage(git, repoPath, f, 2, "ours", hostname, ts, logger)
-		theirsSaved := backupStage(git, repoPath, f, 3, "theirs", hostname, ts, logger)
-		logger.Warn("backed up conflicting file and accepted the upstream version",
-			"file", f, "ours_saved", oursSaved, "theirs_saved", theirsSaved)
-
-		if err := git.CheckoutTheirs(f); err != nil {
-			logger.Error("checkout --theirs failed", "file", f, "error", err)
-			abortMerge(git, logger)
+		stages, err := git.ConflictStages(f)
+		if err != nil {
+			logger.Error("reading conflict stages failed", "file", f, "error", err)
+			abortCycle(git, written, logger)
 			return false
 		}
-		if err := git.AddPath(f); err != nil {
-			logger.Error("git add for conflicting file failed", "file", f, "error", err)
-			abortMerge(git, logger)
+		oursPresent := slices.Contains(stages, ourStage)
+		theirsPresent := slices.Contains(stages, theirStage)
+
+		oursBackup := backupStage(git, repoPath, f, ourStage, "ours", hostname, ts, logger)
+		theirsBackup := backupStage(git, repoPath, f, theirStage, "theirs", hostname, ts, logger)
+		for _, p := range []string{oursBackup, theirsBackup} {
+			if p != "" {
+				written = append(written, p)
+			}
+		}
+
+		if oursPresent && oursBackup == "" {
+			// The local side is unpushed, and the commit carrying it is only
+			// reachable through the losing parent of a merge — which a
+			// path-limited `git log` skips by default. Retry next cycle
+			// rather than accept upstream over content we failed to rescue.
+			logger.Error("local side could not be backed up; leaving the conflict for the next cycle", "file", f)
+			abortCycle(git, written, logger)
+			return false
+		}
+
+		if theirsPresent {
+			logger.Warn("backed up conflicting file and accepted the upstream version",
+				"file", f, "ours_saved", oursBackup != "", "theirs_saved", theirsBackup != "")
+			if err := git.CheckoutTheirs(f); err != nil {
+				logger.Error("checkout --theirs failed", "file", f, "error", err)
+				abortCycle(git, written, logger)
+				return false
+			}
+			if err := git.AddPath(f); err != nil {
+				logger.Error("git add for conflicting file failed", "file", f, "error", err)
+				abortCycle(git, written, logger)
+				return false
+			}
+			continue
+		}
+
+		// Upstream deleted the file. There is no version to check out, so
+		// accepting upstream means removing it; the local content survives
+		// in the .ours backup.
+		logger.Warn("backed up conflicting file and accepted the upstream deletion",
+			"file", f, "ours_saved", oursBackup != "")
+		if err := git.RemovePath(f); err != nil {
+			logger.Error("removing file deleted upstream failed", "file", f, "error", err)
+			abortCycle(git, written, logger)
 			return false
 		}
 	}
 
 	if err := git.AddAll(); err != nil {
 		logger.Error("staging conflict backup files failed", "error", err)
-		abortMerge(git, logger)
+		abortCycle(git, written, logger)
 		return false
 	}
 
@@ -214,7 +271,7 @@ func backupAndAcceptTheirs(git GitClient, repoPath, upstream string, files []str
 		hostname, time.Now().Format("2006-01-02 15:04"), strings.Join(files, ", "))
 	if err := git.Commit(msg); err != nil {
 		logger.Error("committing merge with conflict backups failed", "error", err)
-		abortMerge(git, logger)
+		abortCycle(git, written, logger)
 		return false
 	}
 	logger.Warn("merged upstream, accepting the incoming version of conflicting files; local changes to those files were preserved in backup files",
@@ -222,29 +279,47 @@ func backupAndAcceptTheirs(git GitClient, repoPath, upstream string, files []str
 	return true
 }
 
-func backupStage(git GitClient, repoPath, file string, stage int, side, hostname, ts string, logger *slog.Logger) bool {
+// abortCycle undoes a partial backup resolution: it deletes the backup files
+// written so far, then aborts the merge. Deleting them is what keeps a failed
+// cycle from being cumulative — they are untracked, so aborting the merge
+// alone would leave them for the next cycle to commit.
+func abortCycle(git GitClient, written []string, logger *slog.Logger) {
+	for _, p := range written {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			logger.Error("removing a conflict backup after a failed resolution failed", "path", p, "error", err)
+		}
+	}
+	abortMerge(git, logger)
+}
+
+// backupStage writes one side of a conflict to a backup file and returns the
+// path it wrote. The path is empty when nothing was written: either that
+// stage does not exist (one side deleted the file — an expected shape) or its
+// content could not be read or written.
+func backupStage(git GitClient, repoPath, file string, stage int, side, hostname, ts string, logger *slog.Logger) string {
 	content, ok, err := git.ShowStage(stage, file)
 	if err != nil {
 		logger.Error("reading conflict side failed", "file", file, "side", side, "error", err)
-		return false
+		return ""
 	}
 	if !ok {
-		// Expected for some conflict shapes, e.g. one side deleted the file.
-		return false
+		return ""
 	}
-	if err := writeBackupFile(repoPath, file, hostname, ts, side, content); err != nil {
+	path, err := writeBackupFile(repoPath, file, hostname, ts, side, content)
+	if err != nil {
 		logger.Error("writing conflict backup file failed", "file", file, "side", side, "error", err)
-		return false
+		return ""
 	}
-	return true
+	return path
 }
 
 // writeBackupFile writes content to "<name>.conflict.<host>.<timestamp>.<side><ext>"
-// next to the original file.
-func writeBackupFile(repoPath, file, hostname, ts, side, content string) error {
+// next to the original file and returns the path it wrote.
+func writeBackupFile(repoPath, file, hostname, ts, side, content string) (string, error) {
 	dir := filepath.Dir(file)
 	ext := filepath.Ext(file)
 	base := strings.TrimSuffix(filepath.Base(file), ext)
 	name := fmt.Sprintf("%s.conflict.%s.%s.%s%s", base, hostname, ts, side, ext)
-	return os.WriteFile(filepath.Join(repoPath, dir, name), []byte(content), 0o644)
+	path := filepath.Join(repoPath, dir, name)
+	return path, os.WriteFile(path, []byte(content), 0o644)
 }

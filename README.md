@@ -254,6 +254,13 @@ If a merge stops on a real conflict, `on_conflict` decides what happens:
   that introduced it stays in `git log`/`git reflog`) — but reconciling it
   back into the real file is left to you. Chosen as default because it
   never fails silently: no external dependencies, no API keys to expire.
+
+  When one side deleted the file, only the surviving side gets a backup — a
+  deletion has no content to save. If upstream deleted it, accepting upstream
+  means applying that deletion, and your version is the one in `.ours.`. If
+  you deleted it locally, upstream's version comes back and lands in
+  `.theirs.` too; what the merge drops is your intent to delete, so delete it
+  again if that is what you meant.
 - **`claude`** (opt-in): runs `claude -p` on each conflicted file to
   resolve the markers, then checks the file for leftover `<<<<<<<` /
   `=======` / `>>>>>>>` markers before accepting it. Requires **both**
