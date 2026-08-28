@@ -22,8 +22,10 @@ type GitClient interface {
 	Merge(upstream string) (conflict bool, err error)
 	MergeAbort() error
 	CheckoutTheirs(path string) error
+	RemovePath(path string) error
 	Push(ctx context.Context, remote, branch string) error
 	ConflictedFiles() ([]string, error)
+	ConflictStages(path string) ([]int, error)
 	ShowStage(stage int, path string) (content string, ok bool, err error)
 }
 

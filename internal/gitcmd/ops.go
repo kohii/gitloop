@@ -137,6 +137,54 @@ func (r *Runner) CheckoutTheirs(path string) error {
 	return err
 }
 
+// RemovePath deletes path from the index and the working tree
+// (`git rm -- <path>`). On an unmerged path this also resolves the conflict,
+// which is how a conflict whose incoming side deleted the file is settled:
+// there is no "their version" to check out.
+//
+// No -f: git accepts the removal of an unmerged entry, and requiring force
+// would also mask the case where the working-tree file differs from every
+// index stage.
+func (r *Runner) RemovePath(path string) error {
+	_, err := r.run("rm", "--", path)
+	return err
+}
+
+// ConflictStages reports which index stages exist for an unmerged path
+// (1 = common ancestor, 2 = ours, 3 = theirs). A missing stage means that
+// side has no version of the file: no stage 3 is an incoming deletion, no
+// stage 2 a local one.
+//
+// This reads `git ls-files -u`, not ShowStage, because the shape of the
+// conflict must not be inferred from a failure to read content: ShowStage
+// runs the path's smudge filter, so a locked git-crypt key makes a present
+// stage unreadable. Concluding "the other side deleted it" from that would
+// delete a file upstream still has.
+func (r *Runner) ConflictStages(path string) ([]int, error) {
+	res, err := r.run("ls-files", "-u", "--", path)
+	if err != nil {
+		return nil, err
+	}
+	var stages []int
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		// "<mode> <oid> <stage>\t<path>"
+		meta, _, found := strings.Cut(line, "\t")
+		if !found {
+			continue
+		}
+		fields := strings.Fields(meta)
+		if len(fields) != 3 {
+			continue
+		}
+		stage, convErr := strconv.Atoi(fields[2])
+		if convErr != nil {
+			continue
+		}
+		stages = append(stages, stage)
+	}
+	return stages, nil
+}
+
 // Push runs `git push <remote> <branch>`.
 func (r *Runner) Push(ctx context.Context, remote, branch string) error {
 	_, err := r.runRemote(ctx, "push", remote, branch)

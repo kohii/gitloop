@@ -65,8 +65,10 @@ func (f *fakeGit) MergeFF(string) error                                   { retu
 func (f *fakeGit) Merge(string) (bool, error)                             { return false, nil }
 func (f *fakeGit) MergeAbort() error                                      { return nil }
 func (f *fakeGit) CheckoutTheirs(string) error                            { return nil }
+func (f *fakeGit) RemovePath(string) error                                { return nil }
 func (f *fakeGit) Push(context.Context, string, string) error             { return nil }
 func (f *fakeGit) ConflictedFiles() ([]string, error)                     { return nil, nil }
+func (f *fakeGit) ConflictStages(string) ([]int, error)                   { return nil, nil }
 func (f *fakeGit) ShowStage(int, string) (string, bool, error)            { return "", false, nil }
 
 var _ GitClient = (*fakeGit)(nil)

@@ -219,11 +219,11 @@ check markers gone, `git add`
    yes       no ──► record last_ai_resolve_error
     │        │
     ▼        ▼
-commit the merge               back up ours/theirs per file,
-(phase stays "idle",           `git checkout --theirs` + `git add` each,
- last_ai_resolve_at stamped,   commit the merge
- message prefixed              (phase becomes "conflict")
- "[ai-resolved]")
+commit the merge               back up ours/theirs per file, then
+(phase stays "idle",           accept upstream per file — `git checkout
+ last_ai_resolve_at stamped,   --theirs` + `git add`, or `git rm` where
+ message prefixed              upstream deleted it — commit the merge
+ "[ai-resolved]")              (phase becomes "conflict")
     │                                   │
     ▼                                   ▼
    push  ◄────────────────────────────────┘
@@ -239,6 +239,29 @@ files, and the commit that introduced the local side stays reachable in
 because the merge (with theirs accepted) actually completes and gets
 pushed, the next cycle sees a clean Equal/Ahead state instead of hitting
 the identical conflict again.
+
+**When a side deleted the file** (a modify/delete conflict) only the surviving
+side gets a backup — a deletion has no content to write. If it was upstream
+that deleted, there is no incoming version to check out and
+`git checkout --theirs` fails outright; accepting upstream then means applying
+that deletion with `git rm`, which settles the conflict so the merge can be
+committed.
+
+Finishing the merge is the part that matters. Aborting leaves the backups
+untracked, and `merge --abort` does not remove untracked files, so the next
+cycle commits them, hits the identical conflict, and writes another set under
+a fresh timestamp — one more per cycle, forever, on a branch that never
+converges. Every bail-out in the backup path therefore deletes the backups it
+wrote before aborting.
+
+Which shape a conflict has is read from `git ls-files -u`, not from a failure
+to read content: `ShowStage` runs the path's smudge filter, so a locked
+git-crypt key makes a present stage unreadable. Treating that as "the other
+side deleted it" would delete a file upstream still has. For the same reason,
+a local side that exists in the index but cannot be read aborts the cycle
+rather than accepting upstream over content no backup rescued — the local
+commit carrying it is only reachable through the losing parent of a merge,
+which a path-limited `git log` skips by default.
 
 **Ours vs. theirs naming**: during a merge (unlike a rebase, where the
 convention is inverted), "ours" (index stage 2) is the local branch and

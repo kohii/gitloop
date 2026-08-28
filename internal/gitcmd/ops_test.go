@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -277,6 +278,10 @@ func TestMergeReportsConflict(t *testing.T) {
 		t.Fatalf("ConflictedFiles = %v, want [a.md]", files)
 	}
 
+	if stages, err := r.ConflictStages("a.md"); err != nil || !slices.Equal(stages, []int{1, 2, 3}) {
+		t.Errorf("ConflictStages(a.md) = %v, err=%v, want [1 2 3]: both sides modified a file that has a common ancestor", stages, err)
+	}
+
 	// During a merge (unlike a rebase) "ours" (stage 2) is the local branch
 	// and "theirs" (stage 3) is the branch being merged in.
 	if content, ok, err := r.ShowStage(2, "a.md"); err != nil || !ok || content != "local change\n" {
@@ -302,6 +307,150 @@ func TestMergeReportsConflict(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("StatusPorcelain after MergeAbort = %#v, want clean", entries)
+	}
+}
+
+// TestIncomingDeleteResolvedByRemovePath pins the git behavior that makes
+// RemovePath necessary: when the incoming side deleted the file, there is no
+// stage 3, `git checkout --theirs` fails outright, and only removing the path
+// settles the conflict so the merge can be committed.
+func TestIncomingDeleteResolvedByRemovePath(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := initRepo(t, dir)
+	writeFile(t, dir, "a.md", "base\n")
+	if err := r.AddAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Commit("base"); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, dir, "branch", "upstream")
+
+	// Local edits the file.
+	writeFile(t, dir, "a.md", "base\nlocal change\n")
+	if err := r.AddAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Commit("local change"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Upstream deletes it.
+	runIn(t, dir, "checkout", "-q", "upstream")
+	runIn(t, dir, "rm", "-q", "a.md")
+	runIn(t, dir, "commit", "-q", "-m", "delete a.md")
+	runIn(t, dir, "checkout", "-q", "main")
+
+	conflict, err := r.Merge("upstream")
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if !conflict {
+		t.Fatalf("Merge() conflict = false, want true")
+	}
+
+	if stages, err := r.ConflictStages("a.md"); err != nil || !slices.Equal(stages, []int{1, 2}) {
+		t.Fatalf("ConflictStages(a.md) = %v, err=%v, want [1 2]: the incoming side has no version", stages, err)
+	}
+	if _, ok, err := r.ShowStage(3, "a.md"); ok || err != nil {
+		t.Errorf("ShowStage(3, a.md) ok = %v, err = %v, want false, nil", ok, err)
+	}
+	if err := r.CheckoutTheirs("a.md"); err == nil {
+		t.Error("CheckoutTheirs on an incoming delete succeeded, want an error: this is why RemovePath exists")
+	}
+
+	if err := r.RemovePath("a.md"); err != nil {
+		t.Fatalf("RemovePath: %v", err)
+	}
+	files, err := r.ConflictedFiles()
+	if err != nil {
+		t.Fatalf("ConflictedFiles: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("ConflictedFiles after RemovePath = %v, want none: the conflict must be resolved", files)
+	}
+	if err := r.Commit("merge upstream deletion"); err != nil {
+		t.Fatalf("Commit after RemovePath: %v", err)
+	}
+	if r.hasMergeInProgress() {
+		t.Error("merge still in progress after commit, want it completed")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "a.md")); !os.IsNotExist(err) {
+		t.Errorf("a.md still on disk (err=%v), want it removed with the upstream deletion", err)
+	}
+}
+
+// TestLocalDeleteResolvedByCheckoutTheirs is the mirror of
+// TestIncomingDeleteResolvedByRemovePath: the local side deleted the file and
+// upstream modified it. Here `git checkout --theirs` does work — even though
+// the file is absent from the working tree — so the ordinary accept-upstream
+// path applies. Pinned with real git because the whole modify/delete bug came
+// from a fake whose CheckoutTheirs always succeeded.
+func TestLocalDeleteResolvedByCheckoutTheirs(t *testing.T) {
+	requireGit(t)
+
+	dir := t.TempDir()
+	r := initRepo(t, dir)
+	writeFile(t, dir, "a.md", "base\n")
+	if err := r.AddAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Commit("base"); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, dir, "branch", "upstream")
+
+	// Local deletes the file.
+	runIn(t, dir, "rm", "-q", "a.md")
+	if err := r.Commit("delete a.md locally"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Upstream edits it.
+	runIn(t, dir, "checkout", "-q", "upstream")
+	writeFile(t, dir, "a.md", "base\nupstream change\n")
+	runIn(t, dir, "add", "-A")
+	runIn(t, dir, "commit", "-q", "-m", "upstream change")
+	runIn(t, dir, "checkout", "-q", "main")
+
+	conflict, err := r.Merge("upstream")
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if !conflict {
+		t.Fatalf("Merge() conflict = false, want true")
+	}
+
+	if stages, err := r.ConflictStages("a.md"); err != nil || !slices.Equal(stages, []int{1, 3}) {
+		t.Fatalf("ConflictStages(a.md) = %v, err=%v, want [1 3]: the local side has no version", stages, err)
+	}
+	if _, ok, err := r.ShowStage(2, "a.md"); ok || err != nil {
+		t.Errorf("ShowStage(2, a.md) ok = %v, err = %v, want false, nil", ok, err)
+	}
+
+	if err := r.CheckoutTheirs("a.md"); err != nil {
+		t.Fatalf("CheckoutTheirs with no local version: %v", err)
+	}
+	if err := r.AddPath("a.md"); err != nil {
+		t.Fatalf("AddPath: %v", err)
+	}
+	files, err := r.ConflictedFiles()
+	if err != nil {
+		t.Fatalf("ConflictedFiles: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("ConflictedFiles after accepting theirs = %v, want none", files)
+	}
+	if err := r.Commit("merge upstream edit"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if r.hasMergeInProgress() {
+		t.Error("merge still in progress after commit, want it completed")
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "a.md")); err != nil || string(got) != "base\nupstream change\n" {
+		t.Errorf("a.md = %q, err=%v, want upstream's content restored", got, err)
 	}
 }
 

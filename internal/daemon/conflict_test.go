@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -18,10 +20,14 @@ import (
 // path: it starts "mid-merge" with pre-seeded conflict content and records
 // which recovery operations get called.
 type fakeConflictGit struct {
-	conflictedFiles  []string
-	contents         map[string]map[int]string // path -> stage -> content
+	conflictedFiles []string
+	contents        map[string]map[int]string // path -> stage -> content
+	// unreadableStages lists stages the index holds but ShowStage cannot
+	// read, the shape a locked git-crypt key produces.
+	unreadableStages map[string][]int
 	mergeAbortCalled bool
 	checkedOutTheirs []string
+	removedPaths     []string
 	addAllCalled     bool
 	addedPaths       []string
 	committed        []string
@@ -47,8 +53,22 @@ func (f *fakeConflictGit) CheckoutTheirs(p string) error {
 	f.checkedOutTheirs = append(f.checkedOutTheirs, p)
 	return nil
 }
+func (f *fakeConflictGit) RemovePath(p string) error {
+	f.removedPaths = append(f.removedPaths, p)
+	return nil
+}
 func (f *fakeConflictGit) Push(context.Context, string, string) error { return nil }
 func (f *fakeConflictGit) ConflictedFiles() ([]string, error)         { return f.conflictedFiles, nil }
+func (f *fakeConflictGit) ConflictStages(path string) ([]int, error) {
+	stages := slices.Sorted(maps.Keys(f.contents[path]))
+	for _, s := range f.unreadableStages[path] {
+		if !slices.Contains(stages, s) {
+			stages = append(stages, s)
+		}
+	}
+	slices.Sort(stages)
+	return stages, nil
+}
 func (f *fakeConflictGit) ShowStage(stage int, path string) (string, bool, error) {
 	m, ok := f.contents[path]
 	if !ok {
@@ -109,22 +129,143 @@ func TestResolveConflictsBackupPolicyAcceptsTheirs(t *testing.T) {
 		t.Errorf("committed messages = %v, want exactly one mentioning \"merged upstream with backups\"", git.committed)
 	}
 
+	if ours, theirs := backupSides(t, dir); !ours || !theirs {
+		t.Errorf("backups in %s: ours=%v theirs=%v, want both", dir, ours, theirs)
+	}
+}
+
+// TestResolveConflictsAcceptsIncomingDeletion covers the conflict shape where
+// upstream deleted the file: there is no incoming version to check out, so the
+// only way to settle the conflict — and finish the merge — is to remove the
+// path. The local content is not lost; it lives on in the .ours backup.
+//
+// Getting this wrong strands the repository: an unfinished merge leaves the
+// backup untracked, the next cycle commits it and hits the same conflict, and
+// the backups multiply once per cycle while the branch never converges.
+func TestResolveConflictsAcceptsIncomingDeletion(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	git := &fakeConflictGit{
+		conflictedFiles: []string{"a.md"},
+		contents: map[string]map[int]string{
+			"a.md": {1: "base\n", 2: "ours content\n"},
+		},
+	}
+
+	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictBackup, "test-host", logger, newTestRecorder(t))
+	if !completed || !backup {
+		t.Fatalf("resolveConflicts() = (%v, %v), want (true, true)", completed, backup)
+	}
+	if git.mergeAbortCalled {
+		t.Error("MergeAbort called, want the merge completed instead")
+	}
+	if len(git.removedPaths) != 1 || git.removedPaths[0] != "a.md" {
+		t.Errorf("removedPaths = %v, want [a.md]", git.removedPaths)
+	}
+	if len(git.checkedOutTheirs) != 0 {
+		t.Errorf("checkedOutTheirs = %v, want none: there is no incoming version", git.checkedOutTheirs)
+	}
+	if len(git.committed) != 1 {
+		t.Errorf("committed = %v, want exactly one commit", git.committed)
+	}
+	if ours, theirs := backupSides(t, dir); !ours || theirs {
+		t.Errorf("backups in %s: ours=%v theirs=%v, want ours only", dir, ours, theirs)
+	}
+}
+
+// TestResolveConflictsAcceptsTheirsWhenLocalDeleted is the mirror shape: the
+// local side deleted the file and upstream modified it. Upstream's version is
+// checked out as usual, and the only backup is .theirs — what was lost is the
+// intent to delete, which no file can hold.
+func TestResolveConflictsAcceptsTheirsWhenLocalDeleted(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	git := &fakeConflictGit{
+		conflictedFiles: []string{"a.md"},
+		contents: map[string]map[int]string{
+			"a.md": {1: "base\n", 3: "theirs content\n"},
+		},
+	}
+
+	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictBackup, "test-host", logger, newTestRecorder(t))
+	if !completed || !backup {
+		t.Fatalf("resolveConflicts() = (%v, %v), want (true, true)", completed, backup)
+	}
+	if len(git.checkedOutTheirs) != 1 || git.checkedOutTheirs[0] != "a.md" {
+		t.Errorf("checkedOutTheirs = %v, want [a.md]", git.checkedOutTheirs)
+	}
+	if len(git.removedPaths) != 0 {
+		t.Errorf("removedPaths = %v, want none: upstream still has the file", git.removedPaths)
+	}
+	if ours, theirs := backupSides(t, dir); ours || !theirs {
+		t.Errorf("backups in %s: ours=%v theirs=%v, want theirs only", dir, ours, theirs)
+	}
+}
+
+// TestResolveConflictsAbortsWhenLocalSideUnreadable covers a present-but-
+// unreadable local side, the shape a locked git-crypt key produces: the smudge
+// filter fails, so ShowStage cannot return the content.
+//
+// Three things must not happen. The conflict must not be read as an incoming
+// deletion (that would delete a file upstream still has); upstream must not be
+// accepted over local content that was never rescued into a backup (unpushed,
+// it would then be reachable only through the losing parent of a merge, which
+// a path-limited `git log` skips); and the cycle must not leave backups behind
+// — including the ones already written for the files it got through, since
+// `merge --abort` does not remove untracked files and the next cycle would
+// commit them and write another set.
+func TestResolveConflictsAbortsWhenLocalSideUnreadable(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// The realistic shape: one plain file conflicts alongside a git-crypt one
+	// whose key is locked. a.md is resolved first, so its backups are already
+	// on disk when b.md forces the bail-out.
+	git := &fakeConflictGit{
+		conflictedFiles: []string{"a.md", "b.md"},
+		contents: map[string]map[int]string{
+			"a.md": {1: "base\n", 2: "ours content\n", 3: "theirs content\n"},
+			"b.md": {1: "base\n", 3: "theirs content\n"},
+		},
+		unreadableStages: map[string][]int{"b.md": {2}},
+	}
+
+	completed, backup := resolveConflicts(git, dir, "origin/main", config.OnConflictBackup, "test-host", logger, newTestRecorder(t))
+	if completed || backup {
+		t.Fatalf("resolveConflicts() = (%v, %v), want (false, false)", completed, backup)
+	}
+	if !git.mergeAbortCalled {
+		t.Error("MergeAbort not called, want the merge left for the next cycle")
+	}
+	if len(git.removedPaths) != 0 {
+		t.Errorf("removedPaths = %v, want none: an unreadable local side is not an incoming deletion", git.removedPaths)
+	}
+	if len(git.committed) != 0 {
+		t.Errorf("committed = %v, want no commit", git.committed)
+	}
+	if ours, theirs := backupSides(t, dir); ours || theirs {
+		t.Errorf("backups left in %s: ours=%v theirs=%v, want none: an aborted cycle must not be cumulative", dir, ours, theirs)
+	}
+}
+
+// backupSides reports which conflict backup files landed in dir.
+func backupSides(t *testing.T, dir string) (ours, theirs bool) {
+	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var foundOurs, foundTheirs bool
 	for _, e := range entries {
 		if strings.Contains(e.Name(), ".ours.") {
-			foundOurs = true
+			ours = true
 		}
 		if strings.Contains(e.Name(), ".theirs.") {
-			foundTheirs = true
+			theirs = true
 		}
 	}
-	if !foundOurs || !foundTheirs {
-		t.Errorf("expected both .ours. and .theirs. backup files in %s, got %v", dir, entries)
-	}
+	return ours, theirs
 }
 
 func TestResolveConflictsFallsBackToBackupWhenClaudeUnavailable(t *testing.T) {
@@ -274,21 +415,8 @@ func TestResolveConflictsWithClaudeSkipsMarkerlessConflictAndBacksUp(t *testing.
 		t.Errorf("committed messages = %v, want exactly one backup-path commit", git.committed)
 	}
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var foundOurs, foundTheirs bool
-	for _, e := range entries {
-		if strings.Contains(e.Name(), ".ours.") {
-			foundOurs = true
-		}
-		if strings.Contains(e.Name(), ".theirs.") {
-			foundTheirs = true
-		}
-	}
-	if !foundOurs || !foundTheirs {
-		t.Errorf("expected both .ours. and .theirs. backup files in %s, got %v", dir, entries)
+	if ours, theirs := backupSides(t, dir); !ours || !theirs {
+		t.Errorf("backups in %s: ours=%v theirs=%v, want both", dir, ours, theirs)
 	}
 
 	sf, err := LoadStatusFile(statusPath)
