@@ -339,12 +339,19 @@ can watch gitloop's state without talking to it directly:
 
 If some other process also writes directly to a watched repository (not
 through gitloop), both sides need to avoid touching the working tree at
-the same time. gitloop's half of that: before each cycle, it tries a
+the same time. gitloop's half of that: once a cycle has established that
+it is going to write — commit, fast-forward, or merge — it tries a
 non-blocking `flock` on `save_lock_path`; if that fails because the other
 process is holding it, gitloop retries a few times (waiting `settle`
 between attempts) and then skips the cycle for the next trigger to pick
 up. The other process is expected to hold the same lock (also
 non-blocking) for the duration of its own writes.
+
+A cycle that finds nothing to write never asks for the lock at all, and
+neither do the parts of a cycle that don't touch the checkout — the fetch
+that opens it and the push that ends it. On a repository nobody has
+edited, which is what almost every interval tick finds, gitloop is
+therefore invisible to the other writer.
 
 `save_lock_path` is empty (disabled) by default. Configure it — per
 repository or via the `defaults` block — with a path both writers agree

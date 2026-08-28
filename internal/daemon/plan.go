@@ -58,22 +58,19 @@ type cyclePlan struct {
 // planCycle decides what a sync cycle must do, from the workflow's contract
 // and one observation of the repository.
 //
-// It exists so that the save lock — which shuts an external writer out of the
-// working tree for as long as it is held — is taken only when the cycle is
-// actually going to write to that working tree. Before this, every cycle took
-// it, including the overwhelmingly common one that found a clean tree in sync
-// with its upstream and did nothing at all. That made the fetch interval a
-// direct tax on any process sharing the checkout, and shortening the interval
-// to notice remote changes sooner would have raised it.
+// The distinction it draws is which cycles write to the working tree, because
+// those are the ones that have to hold the save lock — and holding it shuts an
+// external writer out of the checkout for as long as it lasts. Most cycles are
+// the timer finding a clean tree in sync with its upstream, and those must
+// cost that writer nothing.
 //
 // The observation is a snapshot, and what the plan does with it differs by
 // intent. intentMutate is only a decision to acquire the lock: the phases that
 // run under it re-read the repository, because acquiring the lock can take
-// several seconds and the world moves during them. For every other intent, the
-// snapshot is the whole answer — the cycle acts on it and stops. Nothing is
-// lost by that: a change arriving right after an observation raises a file
-// watcher event or waits for the next interval tick, so it is picked up by the
-// next cycle rather than this one.
+// several seconds and the world moves during them. For every other intent the
+// snapshot is the whole answer — the cycle acts on it and stops. A change
+// arriving just after an observation raises a file watcher event or waits for
+// the next tick, so it belongs to the next cycle.
 func planCycle(autoCommits bool, obs cycleObservation) cyclePlan {
 	// Without fresh upstream data there is nothing to classify against, so
 	// the only work still worth doing is preserving local edits as a commit.
