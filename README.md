@@ -138,6 +138,25 @@ could: an editor's save hook, a Raycast or Shortcuts action, a `launchd`
 repository. It talks to the daemon over a unix socket at
 `~/Library/Application Support/gitloop/control.sock`, created mode `0600`.
 
+### Syncing when the machine comes back
+
+Two things change a laptop's view of the world without changing a single
+file, and gitloop syncs every repository on both:
+
+- **Waking from sleep.** The lid opening is when a stale checkout gets
+  noticed, and `fetch_interval` has been asleep along with everything else.
+  gitloop infers a suspend from the gap between the wall clock and its own
+  timers, which do not run while the machine is off, so it acts within a few
+  seconds of waking rather than the instant.
+- **The network changing.** Joining a network, losing one, or moving between
+  them, read from the kernel's routing socket. Because that is a
+  notification rather than a poll, an offline laptop costs nothing to watch
+  and syncs as soon as it reconnects.
+
+Neither needs configuring, and neither cuts short a debounce already in
+progress: if you are mid-edit when the network comes back, the pending
+`settle` window still decides when your changes are committed.
+
 `gitloop lock hold` is a helper for external writers coordinating with
 gitloop via `save_lock_path` (see "Coordinating with another writer" below).
 A caller spawns it as a child process, waits for the line `"acquired\n"` on
@@ -180,8 +199,9 @@ such as `dirty-working-tree` or `diverged-history`.
 
 ## Sync behavior
 
-On every trigger — a debounced file change, the periodic fetch, or a
-`gitloop sync` request — gitloop runs one cycle per repository:
+On every trigger — a debounced file change, the periodic fetch, a `gitloop
+sync` request, or the machine waking up or reconnecting — gitloop runs one
+cycle per repository:
 
 1. **Guard** — skip the cycle if a rebase or merge is already in progress
    (detected by checking `.git/rebase-merge`, `.git/rebase-apply`,

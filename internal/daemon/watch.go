@@ -252,12 +252,18 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, tri
 			runCycle("fetch-interval")
 
 		case <-trigger.signals():
-			// An out-of-band request is the point at which someone already
-			// knows there is something to sync, so it runs a cycle straight
-			// away rather than joining the settle window.
 			reason := trigger.take()
 			if reason == "" {
 				// A signal whose request an earlier pass already took.
+				continue
+			}
+			// An environment event that lands mid-debounce defers to it: the
+			// edit in progress will be committed within `settle` anyway, and
+			// cutting that short to commit a half-written file is the exact
+			// thing the debounce exists to prevent. A person asking for a
+			// sync has already decided otherwise, so their request runs.
+			if reason.isEnvironmental() && settleTimer != nil {
+				logger.Info("environment trigger deferred to the pending settle window", "trigger", reason)
 				continue
 			}
 			runCycle(string(reason))

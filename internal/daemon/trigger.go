@@ -11,7 +11,20 @@ const (
 	// TriggerManual is a person or a script asking for a cycle now, via
 	// `gitloop sync`.
 	TriggerManual triggerReason = "manual"
+	// TriggerWake is the machine having come back from sleep.
+	TriggerWake triggerReason = "wake"
+	// TriggerNetwork is this machine's network attachment having changed.
+	TriggerNetwork triggerReason = "network"
 )
+
+// isEnvironmental reports whether a reason came from the machine's
+// surroundings rather than from someone asking. The difference matters when
+// the file watcher is mid-debounce: a person asking for a sync has decided
+// the working tree is worth committing as it stands, and the environment has
+// no opinion about that.
+func (r triggerReason) isEnvironmental() bool {
+	return r == TriggerWake || r == TriggerNetwork
+}
 
 // repoTrigger is one repository's mailbox for out-of-band cycle requests.
 //
@@ -38,9 +51,16 @@ func newRepoTrigger() *repoTrigger {
 
 // fire asks for a cycle. It never blocks, so a caller holding a connection
 // open cannot stall on a repository whose loop is busy.
+//
+// A request already waiting normally stands, since one cycle answers both.
+// The exception is a person's request arriving behind an environment event:
+// the loop treats the two differently — an environment event defers to a
+// debounce in progress, a person's request does not — so letting the
+// environment event stand would have `gitloop sync` report a cycle that then
+// waits out the settle window it was meant to pre-empt.
 func (t *repoTrigger) fire(reason triggerReason) {
 	t.mu.Lock()
-	if t.pending == "" {
+	if t.pending == "" || (t.pending.isEnvironmental() && !reason.isEnvironmental()) {
 		t.pending = reason
 	}
 	t.mu.Unlock()

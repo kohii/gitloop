@@ -156,6 +156,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		runEnvironmentWatcher(ctx, triggers, d.logger)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		d.runHeartbeat(ctx, recorder)
 	}()
 

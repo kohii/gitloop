@@ -26,6 +26,19 @@ func drain(triggers map[string]*repoTrigger) map[string]triggerReason {
 	return fired
 }
 
+// pending counts the triggers holding a request, without consuming them.
+func pending(triggers map[string]*repoTrigger) int {
+	n := 0
+	for _, trigger := range triggers {
+		trigger.mu.Lock()
+		if trigger.pending != "" {
+			n++
+		}
+		trigger.mu.Unlock()
+	}
+	return n
+}
+
 func testTriggers(paths ...string) map[string]*repoTrigger {
 	triggers := make(map[string]*repoTrigger, len(paths))
 	for _, path := range paths {
