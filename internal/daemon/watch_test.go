@@ -98,7 +98,7 @@ func TestRunRepoLoopDebouncesRapidChangesIntoOneCommit(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	// Give the watcher goroutine time to start and register its watches.
 	time.Sleep(100 * time.Millisecond)
@@ -156,7 +156,7 @@ func TestRunRepoLoopSetsIdlePhaseAfterASuccessfulCycle(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	time.Sleep(100 * time.Millisecond)
 	git.markDirty()
@@ -262,7 +262,7 @@ func TestRunRepoLoopCommitOnlyModeNeverTouchesARemote(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	time.Sleep(50 * time.Millisecond)
 	git.fakeGit.markDirty()
@@ -328,7 +328,7 @@ func TestRunRepoLoopAutoSelectsCommitOnlyWhenModeIsOmittedAndNoRemote(t *testing
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	time.Sleep(50 * time.Millisecond)
 	git.fakeGit.markDirty()
@@ -382,7 +382,7 @@ func TestRunRepoLoopDoesNotDowngradeExplicitSyncWithoutRemote(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	time.Sleep(50 * time.Millisecond)
 	git.fakeGit.markDirty()
@@ -483,7 +483,7 @@ func TestRunRepoLoopSkipsCycleWhileSaveLockIsHeldElsewhere(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	time.Sleep(50 * time.Millisecond)
 	git.markDirty()
@@ -570,7 +570,7 @@ func TestRunRepoLoopDoesNotHoldSaveLockDuringFetch(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	time.Sleep(50 * time.Millisecond)
 	git.fakeGit.markDirty()
@@ -655,7 +655,7 @@ func TestRunRepoLoopCommitsEvenWhenFetchFailsOffline(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	time.Sleep(50 * time.Millisecond)
 	git.fakeGit.markDirty()
@@ -721,7 +721,7 @@ func TestRunRepoLoopCommitsAfterFetchTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	time.Sleep(50 * time.Millisecond)
 	git.markDirty()
@@ -793,7 +793,7 @@ func TestRunRepoLoopReportsPushTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 	time.Sleep(50 * time.Millisecond)
 	git.markDirty()
 	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o644); err != nil {
@@ -840,7 +840,7 @@ func TestRunRepoLoopCancellationInterruptsFetch(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 	select {
 	case <-git.started:
 	case <-time.After(2 * time.Second):
@@ -896,7 +896,7 @@ func TestRunRepoLoopRecordsPushThatFinishesDuringShutdown(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -1015,7 +1015,7 @@ func TestRunRepoLoopReleasesSaveLockAfterCommitPhasePanic(t *testing.T) {
 		defer func() {
 			panicked <- recover() // may deliver nil if no panic, so channel signals completion either way
 		}()
-		_ = runRepoLoop(ctx, git, repo, "test-host", logger, recorder)
+		_ = runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -1046,6 +1046,73 @@ func TestRunRepoLoopReleasesSaveLockAfterCommitPhasePanic(t *testing.T) {
 			t.Fatalf("save lock was still held after panic: (%v, %v)", ok, err)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestRunRepoLoopRunsACycleWhenTriggered pins the out-of-band path. Both
+// other sources are disabled here — the fetch interval is an hour away, and
+// the working tree is marked dirty without touching a file, so the watcher
+// stays quiet — which leaves the trigger as the only thing that could have
+// produced a commit.
+func TestRunRepoLoopRunsACycleWhenTriggered(t *testing.T) {
+	dir := t.TempDir()
+
+	repo := config.Repository{
+		Path:          dir,
+		Settle:        10 * time.Millisecond,
+		MaxWait:       time.Hour,
+		FetchInterval: time.Hour,
+		Mode:          config.ModeSync,
+		Remote:        "origin",
+		Branch:        "main",
+		OnConflict:    config.OnConflictBackup,
+	}
+
+	git := &fakeGit{}
+	trigger := newRepoTrigger()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	recorder, err := newStatusRecorder(filepath.Join(dir, "status.json"))
+	if err != nil {
+		t.Fatalf("newStatusRecorder: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- runRepoLoop(ctx, git, repo, trigger, "test-host", logger, recorder) }()
+
+	time.Sleep(50 * time.Millisecond)
+	git.markDirty()
+	if got := git.commitCount(); got != 0 {
+		t.Fatalf("commit count before the trigger = %d, want 0", got)
+	}
+
+	trigger.fire(TriggerManual)
+	waitFor(t, 2*time.Second, func() bool { return git.commitCount() == 1 })
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runRepoLoop did not shut down within 2s of context cancellation")
+	}
+}
+
+// TestRepoTriggerCoalescesRequests pins the mailbox's capacity contract: what
+// matters is that a cycle runs after the request, not that every request gets
+// one of its own.
+func TestRepoTriggerCoalescesRequests(t *testing.T) {
+	trigger := newRepoTrigger()
+	for range 10 {
+		trigger.fire(TriggerManual) // must not block once the mailbox is full
+	}
+
+	if got := trigger.take(); got != TriggerManual {
+		t.Errorf("take() = %q, want %q", got, TriggerManual)
+	}
+	if got := trigger.take(); got != "" {
+		t.Errorf("ten requests left %q waiting behind the first, want them coalesced", got)
 	}
 }
 
@@ -1085,7 +1152,7 @@ func TestRunRepoLoopWithNothingToDoNeverAsksForTheSaveLock(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	waitFor(t, 2*time.Second, func() bool {
 		sf, err := LoadStatusFile(statusPath)
@@ -1154,7 +1221,7 @@ func TestRunRepoLoopPushesWhileTheSaveLockIsHeldElsewhere(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	select {
 	case <-pushed:
@@ -1234,7 +1301,7 @@ func TestRunRepoLoopPhaseIsIdleDuringPush(t *testing.T) {
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	time.Sleep(50 * time.Millisecond)
 	git.fakeGit.markDirty()

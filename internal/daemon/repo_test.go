@@ -217,7 +217,7 @@ func TestRunRepoLoopCommittedSyncDoesNotCommitWorkingTree(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- runRepoLoop(ctx, git, repo, "test-host", logger, recorder) }()
+	go func() { done <- runRepoLoop(ctx, git, repo, nil, "test-host", logger, recorder) }()
 
 	select {
 	case <-git.pushed:

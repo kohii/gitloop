@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -481,7 +482,7 @@ func TestExpandHome(t *testing.T) {
 		{"~", home},
 		{"~/notes", filepath.Join(home, "notes")},
 		{"/abs/path", "/abs/path"},
-		{"relative/path", "relative/path"},
+		{"/abs/./path/", "/abs/path"},
 	}
 	for _, c := range cases {
 		got, err := expandHome(c.in)
@@ -491,5 +492,26 @@ func TestExpandHome(t *testing.T) {
 		if got != c.want {
 			t.Errorf("expandHome(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestExpandHomeRejectsRelativePaths pins the reason a path here has to be
+// absolute: it is an identity shared between the daemon and the commands that
+// name a repository, and those processes do not share a working directory.
+func TestExpandHomeRejectsRelativePaths(t *testing.T) {
+	for _, path := range []string{"notes", "./notes", "../notes"} {
+		if _, err := expandHome(path); err == nil {
+			t.Errorf("expandHome(%q) was accepted, want an error", path)
+		}
+	}
+}
+
+func TestParseRejectsDuplicateRepositoryPaths(t *testing.T) {
+	_, err := Parse([]byte("repositories:\n  - path: /tmp/notes\n  - path: /tmp/./notes/\n"))
+	if err == nil {
+		t.Fatal("Parse accepted two entries for the same directory, want an error")
+	}
+	if !strings.Contains(err.Error(), "already configured") {
+		t.Errorf("Parse error = %q, want it to explain the duplicate", err)
 	}
 }

@@ -13,6 +13,19 @@ import (
 	"github.com/kohii/gitloop/internal/config"
 )
 
+// shortStateDir returns a temp directory whose path is short enough to hold a
+// unix socket. t.TempDir() embeds the test's name, which routinely pushes a
+// socket path past the ~104-byte limit the kernel imposes on one.
+func shortStateDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "gitloop")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
 // TestDaemonRunRecoversFromPanicAndRetries verifies the error-isolation
 // contract: a repository whose loop panics must be retried with backoff
 // rather than taking down Run or the other repositories.
@@ -41,7 +54,7 @@ func TestDaemonRunRecoversFromPanicAndRetries(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	d, err := New(cfg,
 		WithLogger(logger),
-		WithStatusPath(filepath.Join(dir, "status.json")),
+		WithStatusPath(filepath.Join(shortStateDir(t), "status.json")),
 		withGitFactory(factory),
 		withBackoff(20*time.Millisecond, 20*time.Millisecond),
 	)
@@ -84,7 +97,7 @@ func TestDaemonRunWritesPidAndHeartbeatsIndependentlyOfRepoLoops(t *testing.T) {
 		},
 	}}
 
-	statusPath := filepath.Join(dir, "status.json")
+	statusPath := filepath.Join(shortStateDir(t), "status.json")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	d, err := New(cfg,
 		WithLogger(logger),

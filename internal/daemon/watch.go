@@ -18,13 +18,16 @@ import (
 )
 
 // runRepoLoop watches repo.Path for file changes and drives the settle /
-// max-wait debounced sync cycle, plus a periodic timer-driven cycle, until
-// ctx is canceled. Under config.ModeCommitOnly the cycle stops after the
-// auto-commit phase.
+// max-wait debounced sync cycle, plus a periodic timer-driven cycle and any
+// out-of-band request arriving on trigger, until ctx is canceled. Under
+// config.ModeCommitOnly the cycle stops after the auto-commit phase.
+//
+// A nil trigger means this loop has no out-of-band source, which is how tests
+// that only exercise the timers run.
 //
 // It returns nil only on a graceful ctx cancellation. Any other return is a
 // setup or watcher failure that the caller should treat as retryable.
-func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hostname string, logger *slog.Logger, recorder *statusRecorder) error {
+func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, trigger *repoTrigger, hostname string, logger *slog.Logger, recorder *statusRecorder) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("creating watcher: %w", err)
@@ -247,6 +250,17 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			// us "fetch, and integrate if behind/diverged" without a
 			// separate code path.
 			runCycle("fetch-interval")
+
+		case <-trigger.signals():
+			// An out-of-band request is the point at which someone already
+			// knows there is something to sync, so it runs a cycle straight
+			// away rather than joining the settle window.
+			reason := trigger.take()
+			if reason == "" {
+				// A signal whose request an earlier pass already took.
+				continue
+			}
+			runCycle(string(reason))
 		}
 	}
 }
