@@ -18,13 +18,16 @@ import (
 )
 
 // runRepoLoop watches repo.Path for file changes and drives the settle /
-// max-wait debounced sync cycle, plus a periodic timer-driven cycle, until
-// ctx is canceled. Under config.ModeCommitOnly the cycle stops after the
-// auto-commit phase.
+// max-wait debounced sync cycle, plus a periodic timer-driven cycle and any
+// out-of-band request arriving on trigger, until ctx is canceled. Under
+// config.ModeCommitOnly the cycle stops after the auto-commit phase.
+//
+// A nil trigger means this loop has no out-of-band source, which is how tests
+// that only exercise the timers run.
 //
 // It returns nil only on a graceful ctx cancellation. Any other return is a
 // setup or watcher failure that the caller should treat as retryable.
-func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hostname string, logger *slog.Logger, recorder *statusRecorder) error {
+func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, trigger *repoTrigger, hostname string, logger *slog.Logger, recorder *statusRecorder) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("creating watcher: %w", err)
@@ -102,58 +105,47 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			return
 		}
 
-		// From here on the cycle touches the working tree (auto-commit,
-		// merge, conflict resolution), so we need to be the sole writer.
-		lock, ok := acquireSaveLockWithRetry(repo.SaveLockPath, repo.Settle, logger)
-		if !ok {
-			logger.Warn("skipped: save in-flight")
-			if err := recorder.update(repo.Path, func(s *RepoStatus) {
-				s.LastError = "skipped: save in-flight"
-				s.BlockedReason = BlockedOperation
-			}); err != nil {
-				logger.Error("writing status file failed", "error", err)
-			}
+		// Look before taking the save lock. Most cycles — every timer tick on
+		// a repository nobody has touched — turn out to have no work at all,
+		// and holding the lock through one of those would shut an external
+		// writer out of the working tree for no reason.
+		obs, branch, err := observeCycle(git, repo, syncsRemote, fetchErr == nil)
+		if err != nil {
+			result.Err = err
+			applyCycleResult(recorder, repo.Path, result, logger)
 			return
 		}
-		// Safety net so a panic anywhere in the commit/integrate phase can't
-		// leak the flock and deadlock every subsequent cycle. The explicit
-		// release below is idempotent — this second call is a no-op on the
-		// non-panic path.
-		defer lock.release()
+		plan := planCycle(repo.AutoCommits(), obs)
+		logger.Info("planned sync cycle", "intent", plan.Intent.String(), "dirty", obs.Dirty, "upstream", upstreamLabel(obs.Upstream))
 
-		// Report `syncing` only now, when we actually start writing — a
-		// consumer of status.json watches this to know when to keep out of
-		// the working tree, and fetch (still `idle`) doesn't need that
-		// exclusion.
-		if err := recorder.update(repo.Path, func(s *RepoStatus) { s.Phase = PhaseSyncing }); err != nil {
-			logger.Error("writing status file failed", "error", err)
-		}
-
-		var branch string
 		var needPush bool
-		if repo.AutoCommits() {
-			result = runCommitPhase(git, hostname, logger)
-		} else {
-			result, branch, needPush = runCommittedSyncPhase(git, repo, logger)
-		}
-		if repo.AutoCommits() && syncsRemote && result.Err == nil && fetchErr == nil {
-			integrateResult, b, n := runIntegratePhase(git, repo, hostname, logger, recorder)
-			// Preserve Committed from the commit phase — runIntegratePhase
-			// returns a fresh cycleResult that doesn't know about it.
-			integrateResult.Committed = result.Committed
-			result, branch, needPush = integrateResult, b, n
-		}
-		if result.Err == nil && fetchErr != nil {
+		switch plan.Intent {
+		case intentNothingToDo:
 			result.Err = fetchErr
-		}
+			applyCycleResult(recorder, repo.Path, result, logger)
+			return
 
-		lock.release()
+		case intentBlocked:
+			result.BlockedReason = plan.BlockedReason
+			result.Err = fmt.Errorf("local and upstream histories diverged; manual merge required")
+			applyCycleResult(recorder, repo.Path, result, logger)
+			return
 
-		// Return phase to idle before push: the working tree is no longer
-		// being touched, so an external writer sharing this repo can safely
-		// proceed. Push is network I/O only.
-		if err := recorder.update(repo.Path, func(s *RepoStatus) { s.Phase = PhaseIdle }); err != nil {
-			logger.Error("writing status file failed", "error", err)
+		case intentPush:
+			// Push sends refs to the remote without touching the checkout, so
+			// it needs neither the save lock nor the syncing phase.
+			result.Action = statemachine.Push
+			needPush = true
+
+		case intentMutate:
+			var ran bool
+			result, branch, needPush, ran = runLockedPhases(git, repo, hostname, logger, recorder, fetchErr == nil)
+			if !ran {
+				return
+			}
+			if result.Err == nil && fetchErr != nil {
+				result.Err = fetchErr
+			}
 		}
 
 		// Push is network I/O, run outside the lock so an external writer
@@ -258,6 +250,23 @@ func runRepoLoop(ctx context.Context, git GitClient, repo config.Repository, hos
 			// us "fetch, and integrate if behind/diverged" without a
 			// separate code path.
 			runCycle("fetch-interval")
+
+		case <-trigger.signals():
+			reason := trigger.take()
+			if reason == "" {
+				// A signal whose request an earlier pass already took.
+				continue
+			}
+			// An environment event that lands mid-debounce defers to it: the
+			// edit in progress will be committed within `settle` anyway, and
+			// cutting that short to commit a half-written file is the exact
+			// thing the debounce exists to prevent. A person asking for a
+			// sync has already decided otherwise, so their request runs.
+			if reason.isEnvironmental() && settleTimer != nil {
+				logger.Info("environment trigger deferred to the pending settle window", "trigger", reason)
+				continue
+			}
+			runCycle(string(reason))
 		}
 	}
 }

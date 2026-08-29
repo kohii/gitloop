@@ -56,6 +56,118 @@ func runPreCheckPhase(repoPath string, logger *slog.Logger) (result cycleResult,
 	return cycleResult{}, true
 }
 
+// observeCycle takes the read-only look at the repository that planCycle
+// decides from. Every command it issues only reads, so it runs outside the
+// save lock — that is the whole point of it.
+//
+// upstreamFresh is false when this cycle has no trustworthy remote-tracking
+// data (the fetch failed), which leaves the observation's Upstream nil rather
+// than classifying the local branch against a stale ref.
+func observeCycle(git GitClient, repo config.Repository, syncsRemote, upstreamFresh bool) (obs cycleObservation, branch string, err error) {
+	entries, err := git.StatusPorcelain()
+	if err != nil {
+		return cycleObservation{}, "", fmt.Errorf("status: %w", err)
+	}
+	obs.Dirty = len(entries) > 0
+
+	if !syncsRemote {
+		return obs, "", nil
+	}
+
+	// Resolved here rather than only in the phases below, so a configured
+	// branch that isn't checked out is reported instead of being quietly
+	// treated as a repository with nothing to do.
+	branch, err = checkedOutBranch(git, repo.Branch)
+	if err != nil {
+		return cycleObservation{}, "", err
+	}
+	if !upstreamFresh {
+		return obs, branch, nil
+	}
+
+	ahead, behind, err := git.RevListLeftRightCount(branch, repo.Remote+"/"+branch)
+	if err != nil {
+		return cycleObservation{}, "", fmt.Errorf("rev-list: %w", err)
+	}
+	state := statemachine.Classify(ahead, behind)
+	obs.Upstream = &state
+	return obs, branch, nil
+}
+
+// upstreamLabel renders an observation's upstream state for logging, naming
+// the nil case rather than printing a pointer.
+func upstreamLabel(state *statemachine.RelativeState) string {
+	if state == nil {
+		return "unknown"
+	}
+	return state.String()
+}
+
+// runLockedPhases holds the save lock across every phase of the cycle that
+// writes to the working tree. ran is false when the lock could not be
+// acquired — the skip has already been recorded and the caller should stop.
+//
+// The phases inside re-read the repository rather than trusting the
+// observation that sent the cycle here: acquiring the lock can wait through
+// several settle periods, and an external writer holding it was by definition
+// changing the very files the observation looked at.
+func runLockedPhases(git GitClient, repo config.Repository, hostname string, logger *slog.Logger, recorder *statusRecorder, upstreamFresh bool) (result cycleResult, branch string, needPush bool, ran bool) {
+	lock, ok := acquireSaveLockWithRetry(repo.SaveLockPath, repo.Settle, logger)
+	if !ok {
+		logger.Warn("skipped: save in-flight")
+		if err := recorder.update(repo.Path, func(s *RepoStatus) {
+			s.LastError = "skipped: save in-flight"
+			s.BlockedReason = BlockedOperation
+		}); err != nil {
+			logger.Error("writing status file failed", "error", err)
+		}
+		return cycleResult{}, "", false, false
+	}
+	// Safety net so a panic anywhere in the commit/integrate phase can't
+	// leak the flock and deadlock every subsequent cycle. The explicit
+	// release below is idempotent — this second call is a no-op on the
+	// non-panic path.
+	defer lock.release()
+
+	// Re-run the guard now that we hold the lock. The first PreCheck ran
+	// before the fetch and before the wait for this lock, and a human can
+	// start a rebase in that window.
+	if guarded, proceed := runPreCheckPhase(repo.Path, logger); !proceed {
+		return guarded, "", false, true
+	}
+
+	// Report `syncing` only now, when we actually start writing — a
+	// consumer of status.json watches this to know when to keep out of
+	// the working tree, and fetch (still `idle`) doesn't need that
+	// exclusion.
+	if err := recorder.update(repo.Path, func(s *RepoStatus) { s.Phase = PhaseSyncing }); err != nil {
+		logger.Error("writing status file failed", "error", err)
+	}
+
+	if repo.AutoCommits() {
+		result = runCommitPhase(git, hostname, logger)
+	} else {
+		result, branch, needPush = runCommittedSyncPhase(git, repo, logger)
+	}
+	if repo.AutoCommits() && repo.SyncsRemote() && result.Err == nil && upstreamFresh {
+		integrateResult, b, n := runIntegratePhase(git, repo, hostname, logger, recorder)
+		// Preserve Committed from the commit phase — runIntegratePhase
+		// returns a fresh cycleResult that doesn't know about it.
+		integrateResult.Committed = result.Committed
+		result, branch, needPush = integrateResult, b, n
+	}
+
+	lock.release()
+
+	// Return phase to idle before push: the working tree is no longer
+	// being touched, so an external writer sharing this repo can safely
+	// proceed. Push is network I/O only.
+	if err := recorder.update(repo.Path, func(s *RepoStatus) { s.Phase = PhaseIdle }); err != nil {
+		logger.Error("writing status file failed", "error", err)
+	}
+	return result, branch, needPush, true
+}
+
 // runCommitPhase auto-commits any dirty changes in the working tree. It is
 // the minimum useful work of a sync cycle: even when we can't classify or
 // integrate (e.g. fetch failed because the network is down), running this

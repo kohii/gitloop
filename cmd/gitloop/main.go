@@ -23,6 +23,7 @@ Commands:
   install     Install and start the launchd agent
   reload      Validate the installed config and restart the launchd agent
   uninstall   Stop and remove the launchd agent
+  sync        Ask the running daemon to sync now
   status      Show each configured repository's last known sync state
   lock        Advisory-lock helpers for external writers (see "gitloop lock -h")
   version     Print the version and exit
@@ -56,6 +57,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return reloadCmd(rest, stdout, stderr)
 	case "uninstall":
 		return uninstallCmd(rest, stdout, stderr)
+	case "sync":
+		return syncCmd(rest, stdout, stderr)
 	case "status":
 		return statusCmd(rest, stdout, stderr)
 	case "lock":

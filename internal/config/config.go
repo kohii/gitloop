@@ -280,11 +280,20 @@ func Parse(data []byte) (*Config, error) {
 	}
 
 	repos := make([]Repository, 0, len(raw.Repositories))
+	// A repository's path is its identity — in the status file, and in the
+	// commands that name one. Two entries for the same directory would be two
+	// watch loops racing each other over one checkout under a single name, so
+	// this is a config error rather than something to resolve at runtime.
+	seen := make(map[string]int, len(raw.Repositories))
 	for i, rr := range raw.Repositories {
 		repo, err := resolveRepository(rr, defaults)
 		if err != nil {
 			return nil, fmt.Errorf("config: repositories[%d]: %w", i, err)
 		}
+		if first, dup := seen[repo.Path]; dup {
+			return nil, fmt.Errorf("config: repositories[%d]: path %s is already configured by repositories[%d]", i, repo.Path, first)
+		}
+		seen[repo.Path] = i
 		repos = append(repos, repo)
 	}
 
@@ -597,10 +606,20 @@ func parseOnConflict(raw string) (OnConflict, error) {
 }
 
 // expandHome expands a leading "~" or "~/..." to the current user's home
-// directory. Paths that don't start with "~" are returned unchanged (after
-// being cleaned).
+// directory, and rejects anything else that isn't already absolute.
+//
+// A path in this config is an identity, not a location to look something up
+// from: `gitloop status` and `gitloop sync` name a repository by it, and the
+// daemon keys its status file on it. A relative path would mean whatever
+// directory each of those processes happened to start in — the daemon's
+// under launchd, the user's shell for the commands — so the same config
+// entry would name different repositories to different readers. Refusing it
+// at startup is the only reading that can't be silently wrong.
 func expandHome(path string) (string, error) {
 	if path != "~" && !strings.HasPrefix(path, "~/") {
+		if !filepath.IsAbs(path) {
+			return "", fmt.Errorf("%q must be an absolute path or start with \"~\"", path)
+		}
 		return filepath.Clean(path), nil
 	}
 	home, err := os.UserHomeDir()

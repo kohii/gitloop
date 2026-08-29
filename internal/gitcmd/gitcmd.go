@@ -68,6 +68,24 @@ func (r *Runner) run(args ...string) (Result, error) {
 	return r.runCommand(cmd, args)
 }
 
+// runObserving executes a git subcommand that is only ever asked a question,
+// with the opportunistic index refresh that would otherwise be its one write
+// turned off.
+//
+// Commands like `git status` write the refreshed index back to disk as a
+// cache, taking .git/index.lock to do it. That is a fine trade in an
+// interactive shell and a bad one for a daemon: gitloop asks the same question
+// on every cycle, so it would repeatedly contend for the index lock with
+// whatever the user is doing in the same checkout, to persist a cache nobody
+// asked for. GIT_OPTIONAL_LOCKS=0 suppresses exactly the writes git itself
+// classifies as optional — the answer is unchanged, only the caching of it
+// goes away — and leaves the mandatory index writes of add, commit, and merge
+// untouched.
+func (r *Runner) runObserving(args ...string) (Result, error) {
+	cmd := exec.Command(r.executablePath(), args...)
+	return r.runCommand(cmd, args, "GIT_OPTIONAL_LOCKS=0")
+}
+
 // runRemote executes a network-facing git command and follows ctx for its
 // entire lifetime. Git may delegate transport to children such as ssh, so a
 // canceled command terminates the new process group rather than only the
@@ -155,9 +173,10 @@ func killProcessGroupAfter(pid int, done <-chan struct{}, grace time.Duration) {
 	}
 }
 
-func (r *Runner) runCommand(cmd *exec.Cmd, args []string) (Result, error) {
+func (r *Runner) runCommand(cmd *exec.Cmd, args []string, extraEnv ...string) (Result, error) {
 	cmd.Dir = r.Dir
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(cmd.Env, extraEnv...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

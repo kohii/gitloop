@@ -30,9 +30,10 @@ func (e StatusEntry) IsConflicted() bool {
 }
 
 // StatusPorcelain runs `git status --porcelain` and returns the parsed
-// entries.
+// entries. It is the one read in gitloop's cycle that git would otherwise
+// answer by writing to disk, so it goes through runObserving.
 func (r *Runner) StatusPorcelain() ([]StatusEntry, error) {
-	res, err := r.run("status", "--porcelain")
+	res, err := r.runObserving("status", "--porcelain")
 	if err != nil {
 		return nil, err
 	}

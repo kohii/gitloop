@@ -82,7 +82,11 @@ each fetch and push. A timeout terminates Git and its transport children;
 local commit and merge commands are not interrupted because doing so could
 leave the index or working tree half-mutated.
 
-`~` in `path` is expanded to the user's home directory.
+`path` must be absolute or start with `~`, which is expanded to the user's
+home directory. It is how a repository is named — by `gitloop status` and
+`gitloop sync`, and in the status file — so it has to mean the same
+directory to the daemon under launchd as to a command run from a shell.
+Listing the same directory twice is rejected for the same reason.
 
 When `mode` is omitted, gitloop uses `sync` for repositories with at least one
 configured Git remote and automatically uses `commit-only` when no remotes are
@@ -101,10 +105,57 @@ gitloop run [--config <path>]        # start the daemon in the foreground
 gitloop install [--config <path>]    # register + start the launchd agent
 gitloop reload                       # validate config + restart the launchd agent
 gitloop uninstall                    # stop + remove the launchd agent
+gitloop sync [<path>...]             # ask the running daemon to sync now
 gitloop status [--config <path>]     # show each repository's last sync state
 gitloop lock hold <path>             # hold a save-lock on <path> until stdin closes
 gitloop version
 ```
+
+Only one gitloop daemon runs per user. A second `gitloop run` exits with
+"another gitloop daemon is already running" rather than starting a rival set
+of watch loops over the same repositories.
+
+### Syncing on demand
+
+`gitloop sync` asks the running daemon to start a cycle now instead of
+waiting out `fetch_interval`. With no arguments it syncs every configured
+repository; with paths, only those (resolved to absolute paths, and matched
+against the paths in the daemon's config).
+
+```sh
+gitloop sync              # every configured repository
+gitloop sync ~/notes      # just this one
+```
+
+It returns as soon as the daemon accepts the request, not when the sync has
+finished, and exits non-zero if no daemon is running or a path isn't
+configured. Requests coalesce: asking ten times while a cycle is in flight
+queues one follow-up cycle, not ten.
+
+This is the hook for anything that knows something changed before gitloop
+could: an editor's save hook, a Raycast or Shortcuts action, a `launchd`
+`StartOnMount` job, the last line of a script that writes into the
+repository. It talks to the daemon over a unix socket at
+`~/Library/Application Support/gitloop/control.sock`, created mode `0600`.
+
+### Syncing when the machine comes back
+
+Two things change a laptop's view of the world without changing a single
+file, and gitloop syncs every repository on both:
+
+- **Waking from sleep.** The lid opening is when a stale checkout gets
+  noticed, and `fetch_interval` has been asleep along with everything else.
+  gitloop infers a suspend from the gap between the wall clock and its own
+  timers, which do not run while the machine is off, so it acts within a few
+  seconds of waking rather than the instant.
+- **The network changing.** Joining a network, losing one, or moving between
+  them, read from the kernel's routing socket. Because that is a
+  notification rather than a poll, an offline laptop costs nothing to watch
+  and syncs as soon as it reconnects.
+
+Neither needs configuring, and neither cuts short a debounce already in
+progress: if you are mid-edit when the network comes back, the pending
+`settle` window still decides when your changes are committed.
 
 `gitloop lock hold` is a helper for external writers coordinating with
 gitloop via `save_lock_path` (see "Coordinating with another writer" below).
@@ -148,8 +199,9 @@ such as `dirty-working-tree` or `diverged-history`.
 
 ## Sync behavior
 
-On every trigger (a debounced file change, or the periodic fetch), gitloop
-runs one cycle per repository:
+On every trigger — a debounced file change, the periodic fetch, a `gitloop
+sync` request, or the machine waking up or reconnecting — gitloop runs one
+cycle per repository:
 
 1. **Guard** — skip the cycle if a rebase or merge is already in progress
    (detected by checking `.git/rebase-merge`, `.git/rebase-apply`,
@@ -339,12 +391,19 @@ can watch gitloop's state without talking to it directly:
 
 If some other process also writes directly to a watched repository (not
 through gitloop), both sides need to avoid touching the working tree at
-the same time. gitloop's half of that: before each cycle, it tries a
+the same time. gitloop's half of that: once a cycle has established that
+it is going to write — commit, fast-forward, or merge — it tries a
 non-blocking `flock` on `save_lock_path`; if that fails because the other
 process is holding it, gitloop retries a few times (waiting `settle`
 between attempts) and then skips the cycle for the next trigger to pick
 up. The other process is expected to hold the same lock (also
 non-blocking) for the duration of its own writes.
+
+A cycle that finds nothing to write never asks for the lock at all, and
+neither do the parts of a cycle that don't touch the checkout — the fetch
+that opens it and the push that ends it. On a repository nobody has
+edited, which is what almost every interval tick finds, gitloop is
+therefore invisible to the other writer.
 
 `save_lock_path` is empty (disabled) by default. Configure it — per
 repository or via the `defaults` block — with a path both writers agree
