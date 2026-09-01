@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -211,6 +212,11 @@ type Config struct {
 type rawConfig struct {
 	Repositories []rawRepository `yaml:"repositories"`
 	Defaults     rawDefaults     `yaml:"defaults"`
+	Includes     []string        `yaml:"includes"`
+}
+
+type rawIncludeConfig struct {
+	Repositories []rawRepository `yaml:"repositories"`
 }
 
 type rawRepository struct {
@@ -257,19 +263,121 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: reading %s: %w", path, err)
 	}
-	return Parse(data)
+
+	configPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: resolving %s: %w", path, err)
+	}
+	raw, err := decodeConfig(data)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+
+	included, err := loadIncludedRepositories(configPath, raw.Includes)
+	if err != nil {
+		return nil, err
+	}
+	raw.Repositories = append(raw.Repositories, included...)
+	return resolveConfig(raw)
 }
 
 // Parse parses config file contents already read into memory. It is
 // exposed separately from Load so callers (and tests) don't need a file on
 // disk.
 func Parse(data []byte) (*Config, error) {
+	raw, err := decodeConfig(data)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if len(raw.Includes) != 0 {
+		return nil, fmt.Errorf("config: includes require a config file path; use Load instead of Parse")
+	}
+	return resolveConfig(raw)
+}
+
+func decodeConfig(data []byte) (rawConfig, error) {
 	var raw rawConfig
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&raw); err != nil {
-		return nil, fmt.Errorf("config: parsing YAML: %w", err)
+		return rawConfig{}, fmt.Errorf("parsing YAML: %w", err)
 	}
+	return raw, nil
+}
+
+func decodeIncludeConfig(data []byte) (rawIncludeConfig, error) {
+	var raw rawIncludeConfig
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&raw); err != nil {
+		return rawIncludeConfig{}, fmt.Errorf("parsing YAML: %w", err)
+	}
+	return raw, nil
+}
+
+type includeMatch struct {
+	path    string
+	pattern string
+}
+
+func loadIncludedRepositories(configPath string, patterns []string) ([]rawRepository, error) {
+	if len(patterns) == 0 {
+		return nil, nil
+	}
+
+	matchesByPath := make(map[string]string)
+	configPath = filepath.Clean(configPath)
+	for _, pattern := range patterns {
+		if pattern == "" {
+			return nil, fmt.Errorf("config: includes pattern %q: pattern must not be empty", pattern)
+		}
+
+		globPattern := pattern
+		if !filepath.IsAbs(globPattern) {
+			globPattern = filepath.Join(filepath.Dir(configPath), globPattern)
+		}
+		matches, err := filepath.Glob(globPattern)
+		if err != nil {
+			return nil, fmt.Errorf("config: includes pattern %q: invalid pattern: %w", pattern, err)
+		}
+		for _, match := range matches {
+			match = filepath.Clean(match)
+			if match == configPath {
+				continue
+			}
+			if _, alreadyMatched := matchesByPath[match]; !alreadyMatched {
+				matchesByPath[match] = pattern
+			}
+		}
+	}
+
+	matches := make([]includeMatch, 0, len(matchesByPath))
+	for path, pattern := range matchesByPath {
+		matches = append(matches, includeMatch{path: path, pattern: pattern})
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].path < matches[j].path
+	})
+
+	repositories := make([]rawRepository, 0)
+	for _, match := range matches {
+		data, err := os.ReadFile(match.path)
+		if err != nil {
+			return nil, fmt.Errorf("config: includes pattern %q, file %s: reading: %w", match.pattern, match.path, err)
+		}
+		fragment, err := decodeIncludeConfig(data)
+		if err != nil {
+			return nil, fmt.Errorf("config: includes pattern %q, file %s: %w", match.pattern, match.path, err)
+		}
+		if len(fragment.Repositories) == 0 {
+			return nil, fmt.Errorf("config: includes pattern %q, file %s: at least one repository is required", match.pattern, match.path)
+		}
+		repositories = append(repositories, fragment.Repositories...)
+	}
+	return repositories, nil
+}
+
+func resolveConfig(raw rawConfig) (*Config, error) {
 	if len(raw.Repositories) == 0 {
 		return nil, fmt.Errorf("config: at least one repository is required")
 	}

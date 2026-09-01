@@ -470,6 +470,233 @@ func TestLoadReadsFromDisk(t *testing.T) {
 	}
 }
 
+func TestLoadIncludesRepositoriesWithMainDefaults(t *testing.T) {
+	dir := t.TempDir()
+	includeDir := filepath.Join(dir, "config.d")
+	if err := os.Mkdir(includeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mainRepo := filepath.Join(dir, "main")
+	firstRepo := filepath.Join(dir, "first")
+	secondRepo := filepath.Join(dir, "second")
+	configPath := filepath.Join(dir, "config.yaml")
+	config := "includes:\n  - config.d/*.yaml\ndefaults:\n  settle: 7s\nrepositories:\n  - path: " + mainRepo + "\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(includeDir, "20-second.yaml"), []byte("repositories:\n  - path: "+secondRepo+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(includeDir, "10-first.yaml"), []byte("repositories:\n  - path: "+firstRepo+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Repositories) != 3 {
+		t.Fatalf("len(Repositories) = %d, want 3", len(cfg.Repositories))
+	}
+	wantPaths := []string{mainRepo, firstRepo, secondRepo}
+	for i, wantPath := range wantPaths {
+		if got := cfg.Repositories[i].Path; got != wantPath {
+			t.Errorf("Repositories[%d].Path = %q, want %q", i, got, wantPath)
+		}
+		if got := cfg.Repositories[i].Settle; got != 7*time.Second {
+			t.Errorf("Repositories[%d].Settle = %v, want 7s from main defaults", i, got)
+		}
+	}
+}
+
+func TestLoadAllowsIncludePatternWithNoMatches(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	config := "includes:\n  - config.d/*.yaml\nrepositories:\n  - path: " + filepath.Join(dir, "notes") + "\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Repositories) != 1 {
+		t.Fatalf("len(Repositories) = %d, want 1", len(cfg.Repositories))
+	}
+}
+
+func TestLoadIncludesCanProvideAllRepositories(t *testing.T) {
+	dir := t.TempDir()
+	includeDir := filepath.Join(dir, "config.d")
+	if err := os.Mkdir(includeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("includes:\n  - config.d/*.yaml\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(includeDir, "repositories.yaml"), []byte("repositories:\n  - path: "+filepath.Join(dir, "notes")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Repositories) != 1 {
+		t.Fatalf("len(Repositories) = %d, want 1", len(cfg.Repositories))
+	}
+}
+
+func TestLoadSkipsMainConfigWhenItMatchesIncludePattern(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	fragmentPath := filepath.Join(dir, "fragment.yaml")
+	config := "includes:\n  - '*.yaml'\nrepositories:\n  - path: " + filepath.Join(dir, "main") + "\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fragmentPath, []byte("repositories:\n  - path: "+filepath.Join(dir, "included")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Repositories) != 2 {
+		t.Fatalf("len(Repositories) = %d, want 2 after skipping the main config", len(cfg.Repositories))
+	}
+}
+
+func TestLoadRejectsDuplicateRepositoryPathsAcrossIncludes(t *testing.T) {
+	dir := t.TempDir()
+	includeDir := filepath.Join(dir, "config.d")
+	if err := os.Mkdir(includeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	repoPath := filepath.Join(dir, "notes")
+	config := "includes:\n  - config.d/*.yaml\nrepositories:\n  - path: " + filepath.Join(dir, ".", "notes") + "\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(includeDir, "notes.yaml"), []byte("repositories:\n  - path: "+repoPath+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(configPath)
+	if err == nil {
+		t.Fatal("Load accepted duplicate repository paths across config files")
+	}
+	if !strings.Contains(err.Error(), "already configured") {
+		t.Errorf("Load error = %q, want it to explain the duplicate", err)
+	}
+}
+
+func TestLoadReportsInvalidIncludePattern(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("includes:\n  - \"[\"\nrepositories:\n  - path: "+filepath.Join(dir, "notes")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(configPath)
+	if err == nil {
+		t.Fatal("Load accepted an invalid include pattern")
+	}
+	if !strings.Contains(err.Error(), `includes pattern "["`) {
+		t.Errorf("Load error = %q, want the invalid pattern", err)
+	}
+}
+
+func TestLoadReportsUnreadableIncludeFile(t *testing.T) {
+	dir := t.TempDir()
+	includeDir := filepath.Join(dir, "config.d")
+	if err := os.Mkdir(includeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	includePath := filepath.Join(includeDir, "fragment.yaml")
+	if err := os.Mkdir(includePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	config := "includes:\n  - config.d/*.yaml\nrepositories:\n  - path: " + filepath.Join(dir, "notes") + "\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(configPath)
+	if err == nil {
+		t.Fatal("Load accepted an unreadable include target")
+	}
+	if !strings.Contains(err.Error(), "config.d/*.yaml") || !strings.Contains(err.Error(), includePath) {
+		t.Errorf("Load error = %q, want pattern and file path", err)
+	}
+}
+
+func TestLoadReportsInvalidIncludeYAML(t *testing.T) {
+	dir := t.TempDir()
+	includeDir := filepath.Join(dir, "config.d")
+	if err := os.Mkdir(includeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	includePath := filepath.Join(includeDir, "broken.yaml")
+	if err := os.WriteFile(includePath, []byte("repositories:\n  - path: [\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	config := "includes:\n  - config.d/*.yaml\nrepositories:\n  - path: " + filepath.Join(dir, "notes") + "\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(configPath)
+	if err == nil {
+		t.Fatal("Load accepted invalid include YAML")
+	}
+	if !strings.Contains(err.Error(), "config.d/*.yaml") || !strings.Contains(err.Error(), includePath) {
+		t.Errorf("Load error = %q, want pattern and file path", err)
+	}
+}
+
+func TestLoadRejectsUnsupportedIncludeFields(t *testing.T) {
+	dir := t.TempDir()
+	includeDir := filepath.Join(dir, "config.d")
+	if err := os.Mkdir(includeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	includePath := filepath.Join(includeDir, "defaults.yaml")
+	if err := os.WriteFile(includePath, []byte("repositories:\n  - path: "+filepath.Join(dir, "notes")+"\ndefaults:\n  settle: 1s\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	config := "includes:\n  - config.d/*.yaml\nrepositories:\n  - path: " + filepath.Join(dir, "main") + "\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(configPath)
+	if err == nil {
+		t.Fatal("Load accepted defaults in an include fragment")
+	}
+	if !strings.Contains(err.Error(), includePath) || !strings.Contains(err.Error(), "defaults") {
+		t.Errorf("Load error = %q, want include path and unsupported field", err)
+	}
+}
+
+func TestParseRejectsIncludesWithoutConfigPath(t *testing.T) {
+	_, err := Parse([]byte("includes:\n  - config.d/*.yaml\nrepositories:\n  - path: ~/notes\n"))
+	if err == nil {
+		t.Fatal("Parse accepted includes without a config path")
+	}
+	if !strings.Contains(err.Error(), "use Load instead of Parse") {
+		t.Errorf("Parse error = %q, want it to direct callers to Load", err)
+	}
+}
+
 func TestExpandHome(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {
