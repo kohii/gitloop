@@ -31,6 +31,21 @@ Every other setting has a default (see below), so this is enough to start
 watching `~/notes` for changes. If it has a Git remote, gitloop syncs it using
 `origin`; if it has no remotes, gitloop automatically uses commit-only mode.
 
+Repositories can be split across files with `includes`:
+
+```yaml
+includes:
+  - config.d/*.yaml
+repositories:
+  - path: ~/notes
+```
+
+Relative patterns are resolved from the directory containing the main config
+file. Matching files are read in lexical order; a pattern with no matches is
+allowed. Include files may contain only `repositories`, and the main file's
+`defaults` apply to their entries as well. The main config is ignored if a
+pattern matches it.
+
 A fuller example, overriding some settings per repository and some via the
 shared `defaults` block:
 
