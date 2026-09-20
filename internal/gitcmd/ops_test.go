@@ -2,6 +2,8 @@ package gitcmd
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -144,6 +146,40 @@ func TestFetchAndRevListLeftRightCount(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(localDir, "b.md")); err != nil {
 		t.Errorf("expected b.md to exist after fast-forward merge: %v", err)
 	}
+}
+
+// TestFetchDoesNotWriteFetchHead pins the one thing that keeps a background
+// fetch from breaking the user's own `git pull` in the same checkout: the
+// daemon must not touch FETCH_HEAD, which pull rewrites non-atomically and
+// then reads back (see Fetch).
+func TestFetchDoesNotWriteFetchHead(t *testing.T) {
+	requireGit(t)
+
+	remoteDir := t.TempDir()
+	runIn(t, "", "init", "-q", "--bare", "-b", "main", remoteDir)
+
+	localDir := t.TempDir()
+	local := initRepo(t, localDir)
+	writeFile(t, localDir, "a.md", "hello\n")
+	if err := local.AddAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := local.Commit("initial"); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, localDir, "remote", "add", "origin", remoteDir)
+	runIn(t, localDir, "push", "-q", "origin", "main")
+
+	if err := local.Fetch(context.Background(), "origin"); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(localDir, ".git", "FETCH_HEAD")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("expected Fetch to leave .git/FETCH_HEAD unwritten, stat error = %v", err)
+	}
+	// The remote-tracking ref is what the fetch is actually for, so prove it
+	// still lands without FETCH_HEAD — runOut fails the test if it doesn't.
+	runOut(t, localDir, "rev-parse", "refs/remotes/origin/main")
 }
 
 // behindRepo builds a repository on main, one commit behind a local

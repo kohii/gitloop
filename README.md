@@ -9,7 +9,8 @@ syncing an Obsidian vault to GitHub.
 One gitloop process watches every repository listed in its config, each in
 its own goroutine, so a problem in one repository never affects another.
 
-**Status:** macOS only. Requires the system `git` CLI on `PATH`.
+**Status:** macOS only. Requires the system `git` CLI (2.29 or newer) on
+`PATH`.
 
 ## Install
 

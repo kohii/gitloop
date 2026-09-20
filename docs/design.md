@@ -12,8 +12,9 @@ generated launchd agent looks like.
   (`git show :2:<path>` / `:3:<path>`) — all exactly as the system git
   implements them. A Go git library would mean re-implementing or
   approximating that behavior; shelling out gets it for free and stays
-  compatible with whatever git version and config (credential helpers,
-  hooks) the user already has.
+  compatible with whatever git config (credential helpers, hooks) the user
+  already has. Any git from 2.29 onward will do — see "Why fetch doesn't
+  write FETCH_HEAD" for the single flag that sets that floor.
 - **`github.com/fsnotify/fsnotify`** for file watching. It's the de facto
   standard cross-platform (kqueue/inotify/ReadDirectoryChangesW) wrapper;
   nothing gitloop needs justifies a custom syscall layer.
@@ -86,6 +87,30 @@ leave the index or working tree in an intermediate state, while a failed
 remote operation can safely be retried from repository state on the next
 cycle.
 
+### Why fetch doesn't write FETCH_HEAD
+
+A daemon fetching every minute shares `.git` with a human running `git pull`
+in the same checkout, and FETCH_HEAD is where the two collide. `git pull` is
+fetch-then-integrate, and the integrate half learns what to merge or rebase
+onto by reading the FETCH_HEAD its own fetch just wrote. Git truncates and
+rewrites that file instead of replacing it atomically, so a gitloop fetch
+landing inside that window leaves pull reading a file with two mergeable
+entries in it, and pull aborts with `Cannot rebase onto multiple branches`
+(or `Cannot fast-forward to multiple branches`) over a repository where
+nothing is actually wrong. It is rare, unreproducible on demand, and reads as
+a corrupted checkout to whoever hits it.
+
+`git fetch --no-write-fetch-head` removes gitloop as one of the two writers.
+Nothing here wants the file: the daemon never reads FETCH_HEAD, and
+classifies the branch against the upstream ref by name
+(`git rev-list --left-right --count <branch>...<remote>/<branch>`), so
+suppressing the file costs nothing and leaves the remote-tracking refs
+updated just the same.
+
+Unlike the `merge.autoStash` override below, this one can't be a `-c` setting
+— git has the flag and no config key for it — so it is the one place gitloop
+requires a particular git: 2.29 (2020-10) or newer.
+
 ### Why git decides whether a fast-forward is safe
 
 Requiring a clean working tree is the obvious rule and the wrong one: on a
@@ -120,12 +145,9 @@ reinterpreted by the user's own git config. Under `merge.autostash = true`, git
 stashes the conflicting changes, fast-forwards, fails to reapply them, and
 **exits 0** — handing the daemon a successful merge whose working tree holds
 conflict markers and whose stash holds the user's work. No `MERGE_HEAD` is
-written, so `PreCheck` would not catch it on the next cycle either. The `-c`
-override is used rather than the `--no-autostash` flag because that flag only
-exists in git 2.27 and later, alongside the config key it suppresses: older
-gits ignore the unknown key and have no autostash to begin with, so one
-spelling covers every version and the "works with whatever git you have"
-property above survives.
+written, so `PreCheck` would not catch it on the next cycle either. The
+override is spelled as config rather than as the equivalent `--no-autostash`
+flag so that it names exactly the user setting it neutralizes.
 
 The one thing neither gitloop nor git guards: a locally-kept file matched by
 `.gitignore` is silently overwritten if upstream starts tracking that path.

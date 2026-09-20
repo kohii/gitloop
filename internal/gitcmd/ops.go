@@ -28,9 +28,23 @@ func (r *Runner) Commit(message string) error {
 	return err
 }
 
-// Fetch runs `git fetch <remote>`.
+// Fetch updates the remote-tracking refs for remote
+// (`git fetch --no-write-fetch-head <remote>`).
+//
+// Suppressing FETCH_HEAD is what keeps a background fetch from breaking the
+// user's own `git pull` in the same checkout. Pull decides what to merge or
+// rebase onto by reading the FETCH_HEAD its own fetch just wrote, and git
+// rewrites that file in place rather than replacing it atomically, so a fetch
+// landing in the same instant leaves pull reading two mergeable entries and
+// aborting with `Cannot rebase onto multiple branches` over a repository
+// where nothing is wrong.
+//
+// Nothing here wants the file: gitloop never reads FETCH_HEAD, and compares
+// against the upstream ref by name (see RevListLeftRightCount). Unlike
+// merge.autoStash in MergeFF this has no config spelling, so it is the one
+// place gitloop requires a particular git: 2.29 (2020-10) or newer.
 func (r *Runner) Fetch(ctx context.Context, remote string) error {
-	_, err := r.runRemote(ctx, "fetch", remote)
+	_, err := r.runRemote(ctx, "fetch", "--no-write-fetch-head", remote)
 	return err
 }
 
