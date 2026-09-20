@@ -145,12 +145,9 @@ reinterpreted by the user's own git config. Under `merge.autostash = true`, git
 stashes the conflicting changes, fast-forwards, fails to reapply them, and
 **exits 0** — handing the daemon a successful merge whose working tree holds
 conflict markers and whose stash holds the user's work. No `MERGE_HEAD` is
-written, so `PreCheck` would not catch it on the next cycle either. The `-c`
-override is used rather than the `--no-autostash` flag because that flag only
-exists in git 2.27 and later, alongside the config key it suppresses: older
-gits ignore the unknown key and have no autostash to begin with, so one
-spelling covers every version and the "works with whatever git you have"
-property above survives.
+written, so `PreCheck` would not catch it on the next cycle either. The
+override is spelled as config rather than as the equivalent `--no-autostash`
+flag so that it names exactly the user setting it neutralizes.
 
 The one thing neither gitloop nor git guards: a locally-kept file matched by
 `.gitignore` is silently overwritten if upstream starts tracking that path.
