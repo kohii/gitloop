@@ -18,7 +18,7 @@ generated launchd agent looks like.
 - **`github.com/fsnotify/fsnotify`** for file watching. It's the de facto
   standard cross-platform (kqueue/inotify/ReadDirectoryChangesW) wrapper;
   nothing gitloop needs justifies a custom syscall layer.
-- **`gopkg.in/yaml.v3`** for config parsing. Config is a small, mostly-flat
+- **`go.yaml.in/yaml/v3`** for config parsing. Config is a small, mostly-flat
   structure; a full config framework would be more machinery than the
   problem needs.
 - **`golang.org/x/sys/unix`** for `flock` (`unix.Flock`), used by the save
